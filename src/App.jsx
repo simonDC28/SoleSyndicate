@@ -1,7 +1,160 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
+import AiShoeScanner from './components/AiShoeScanner';
+import {
+  createListingInSupabase,
+  deleteConversationInSupabase,
+  deleteListingFromSupabase,
+  fetchListingsFromSupabase,
+  fetchUserAccountFromSupabase,
+  fetchUserMessagesFromSupabase,
+  isSupabaseConfigured,
+  saveUserAccountToSupabase,
+  sendMessageInSupabase,
+  subscribeToListings,
+  subscribeToUserMessages,
+  uploadSneakerImageToSupabase
+} from './supabaseClient';
 
-// In-memory cache so transparent shoe cutouts render instantaneously across slide switches
+// =========================================================
+// GOOGLE / GMAIL OAUTH 2.0 API HELPER (DYNAMIC SDK LOADER)
+// =========================================================
+const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
+const GOOGLE_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v3/userinfo';
+const GOOGLE_CLIENT_ID =
+  (import.meta.env.VITE_GOOGLE_CLIENT_ID || '').trim() ||
+  '51592992726-itv7lmapugm76dgv5fn74j1jsc42spn5.apps.googleusercontent.com';
+
+let gisLoaderPromise = null;
+
+function loadGoogleIdentityScript() {
+  if (typeof window === 'undefined') {
+    return Promise.reject(new Error('Browser environment is required.'));
+  }
+  if (window.google?.accounts?.oauth2) {
+    return Promise.resolve(window.google.accounts.oauth2);
+  }
+  if (gisLoaderPromise) {
+    return gisLoaderPromise;
+  }
+
+  gisLoaderPromise = new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${GIS_SCRIPT_URL}"]`);
+    if (existing) {
+      existing.addEventListener('load', () => {
+        if (window.google?.accounts?.oauth2) {
+          resolve(window.google.accounts.oauth2);
+        } else {
+          gisLoaderPromise = null;
+          reject(new Error('Google OAuth2 client failed to initialize.'));
+        }
+      });
+      existing.addEventListener('error', () => {
+        gisLoaderPromise = null;
+        reject(new Error('Failed to load Google Identity Services SDK.'));
+      });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = GIS_SCRIPT_URL;
+    script.async = true;
+    script.defer = true;
+
+    script.onload = () => {
+      if (window.google?.accounts?.oauth2) {
+        resolve(window.google.accounts.oauth2);
+      } else {
+        gisLoaderPromise = null;
+        reject(new Error('Google OAuth2 client unavailable after script load.'));
+      }
+    };
+
+    script.onerror = () => {
+      gisLoaderPromise = null;
+      reject(
+        new Error(
+          'Unable to load Google Identity Services. Check your internet connection.'
+        )
+      );
+    };
+
+    document.head.appendChild(script);
+  });
+
+  return gisLoaderPromise;
+}
+
+async function authenticateWithGoogleApi(prompt = 'select_account') {
+  const googleOAuth = await loadGoogleIdentityScript();
+
+  return new Promise((resolve, reject) => {
+    const tokenClient = googleOAuth.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: 'openid email profile',
+      prompt,
+      callback: async (tokenResponse) => {
+        if (tokenResponse.error) {
+          reject(
+            new Error(
+              tokenResponse.error_description ||
+                'Google sign-in was cancelled or denied.'
+            )
+          );
+          return;
+        }
+
+        try {
+          const res = await fetch(GOOGLE_USERINFO_ENDPOINT, {
+            headers: {
+              Authorization: `Bearer ${tokenResponse.access_token}`
+            }
+          });
+
+          if (!res.ok) {
+            throw new Error('Failed to fetch Gmail profile from Google API.');
+          }
+
+          const profile = await res.json();
+          resolve({
+            googleSub: profile.sub,
+            email: profile.email,
+            emailVerified: Boolean(profile.email_verified),
+            name: profile.name || profile.email.split('@')[0],
+            avatar: profile.picture || '',
+            accessToken: tokenResponse.access_token
+          });
+        } catch (err) {
+          reject(err);
+        }
+      },
+      error_callback: (err) => {
+        reject(
+          new Error(
+            err?.message || 'Unable to open Google OAuth popup window.'
+          )
+        );
+      }
+    });
+
+    tokenClient.requestAccessToken({ prompt });
+  });
+}
+
+function signOutGoogleSession(accessToken) {
+  try {
+    window.google?.accounts?.id?.disableAutoSelect();
+    if (accessToken && window.google?.accounts?.oauth2?.revoke) {
+      window.google.accounts.oauth2.revoke(accessToken, () => {});
+    }
+  } catch {
+    // Ignore SDK cleanup errors
+  }
+}
+
+// =========================================================
+// TRANSPARENT SHOE CUTOUT & IMAGE UTILITIES
+// =========================================================
 const transparentShoeCache = new Map();
 
 function TransparentShoeImg({ src, alt, className, draggable = false }) {
@@ -173,7 +326,6 @@ function TransparentShoeImg({ src, alt, className, draggable = false }) {
   );
 }
 
-// Resize uploaded images via canvas so localStorage stays lightweight and fast
 function compressImageFile(file, maxDim = 760, quality = 0.84) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -209,8 +361,14 @@ function getInitials(name = 'SS') {
   );
 }
 
-function formatChatTime() {
-  return new Date().toLocaleTimeString([], {
+function formatMessageTimestamp(isoString) {
+  if (!isoString) {
+    return new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+  return new Date(isoString).toLocaleTimeString([], {
     hour: '2-digit',
     minute: '2-digit'
   });
@@ -222,61 +380,882 @@ function getProductSeller(product) {
       name: 'SoleSyndicate Concierge',
       location: 'Verified Dispatch Hub',
       avatar: '',
-      bio: 'Official SoleSyndicate sneaker specialist • Replies in minutes'
+      bio: 'Official SoleSyndicate sneaker specialist'
     }
   );
 }
 
-function buildSellerReply(buyerText, product) {
-  const seller = getProductSeller(product);
-  const text = buyerText.toLowerCase();
-  const sizesList = (product.options || ['US 9', 'US 10']).join(', ');
-
-  if (
-    text.includes('meetup') ||
-    text.includes('location') ||
-    text.includes('where') ||
-    text.includes('pick up') ||
-    text.includes('pickup')
-  ) {
-    return `Hey! I'm based in ${seller.location}. We can definitely arrange a local meetup in a safe public spot, or I can ship same-day with full tracking!`;
+function isListingOwner(product, user) {
+  if (!product?.isUserListing || !user?.email || !product?.ownerEmail) {
+    return false;
   }
-
-  if (
-    text.includes('price') ||
-    text.includes('offer') ||
-    text.includes('discount') ||
-    text.includes('lowest') ||
-    text.includes('nego') ||
-    text.includes('last')
-  ) {
-    const dealPrice = Math.max(20, product.price - 10);
-    return `Thanks for reaching out! The ${product.name} is listed at $${product.price}, and I can do $${dealPrice} if you're ready to grab it today.`;
-  }
-
-  if (
-    text.includes('available') ||
-    text.includes('size') ||
-    text.includes('stock') ||
-    text.includes('fit')
-  ) {
-    return `Yes, the ${product.name} is still available! Right now I have ${sizesList} ready to go. They fit true to size—let me know which size you need.`;
-  }
-
-  if (
-    text.includes('photo') ||
-    text.includes('box') ||
-    text.includes('legit') ||
-    text.includes('authentic') ||
-    text.includes('condition')
-  ) {
-    return `100% authentic with the original box and inner size tag intact. Everything has been inspected and is ready to ship or meet up in ${seller.location}.`;
-  }
-
-  return `Hi! Thanks for messaging about the ${product.name}. I'm in ${seller.location}—let me know if you want to check sizing (${sizesList}), condition, or delivery options!`;
+  return (
+    product.ownerEmail.trim().toLowerCase() === user.email.trim().toLowerCase()
+  );
 }
 
-// 6 Hero Showcase Slides: 2 Nike, 2 Adidas, and 2 On Cloud (including Rose Pink)
+function buildThreadKey(listingId, buyerEmail) {
+  return `${String(listingId)}::${buyerEmail.trim().toLowerCase()}`;
+}
+
+function groupMessageRowsIntoThreads(rows) {
+  const map = {};
+  (rows || []).forEach((row) => {
+    const key = buildThreadKey(row.listing_id, row.buyer_email);
+    if (!map[key]) {
+      map[key] = {
+        threadKey: key,
+        listingId: String(row.listing_id),
+        listingName: row.listing_name,
+        listingImage: row.listing_image || '',
+        listingPrice: Number(row.listing_price || 0),
+        sellerEmail: row.seller_email.trim().toLowerCase(),
+        sellerName: row.seller_name,
+        buyerEmail: row.buyer_email.trim().toLowerCase(),
+        buyerName: row.buyer_name,
+        messages: []
+      };
+    }
+    map[key].messages.push({
+      id: row.id,
+      senderEmail: row.sender_email.trim().toLowerCase(),
+      senderName: row.sender_name,
+      text: row.message_text,
+      time: formatMessageTimestamp(row.created_at),
+      createdAt: row.created_at
+    });
+  });
+  return map;
+}
+
+// =========================================================
+// GMAIL / GOOGLE API LOGIN & REGISTRATION MODAL
+// =========================================================
+function GoogleGIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"
+      />
+    </svg>
+  );
+}
+
+function AuthModal({
+  initialMode = 'login',
+  registeredUsers,
+  onClose,
+  onCompleteAuth
+}) {
+  const [mode, setMode] = useState(initialMode);
+  const [isLoadingGoogle, setIsLoadingGoogle] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [location, setLocation] = useState('');
+  const [role, setRole] = useState('Buyer & Seller');
+
+  const [pendingGoogleProfile, setPendingGoogleProfile] = useState(null);
+  const [onboardName, setOnboardName] = useState('');
+  const [onboardLocation, setOnboardLocation] = useState('');
+  const [onboardBio, setOnboardBio] = useState('');
+
+  const handleGoogleOAuthClick = async () => {
+    setError('');
+    setIsLoadingGoogle(true);
+    try {
+      const googleUser = await authenticateWithGoogleApi(
+        mode === 'register' ? 'consent select_account' : 'select_account'
+      );
+
+      const cleanEmail = googleUser.email.trim().toLowerCase();
+      const localMatch = registeredUsers.find(
+        (u) =>
+          u.email.toLowerCase() === cleanEmail ||
+          (u.googleSub && u.googleSub === googleUser.googleSub)
+      );
+      const cloudMatch = isSupabaseConfigured
+        ? await fetchUserAccountFromSupabase(cleanEmail)
+        : null;
+
+      const existing = cloudMatch
+        ? {
+            id: `user_${cleanEmail}`,
+            googleSub: cloudMatch.google_sub || googleUser.googleSub,
+            authProvider: 'google',
+            emailVerified: true,
+            name: cloudMatch.name || googleUser.name,
+            email: cleanEmail,
+            location: cloudMatch.location || '',
+            role: cloudMatch.role || 'Buyer & Seller',
+            avatar: googleUser.avatar || cloudMatch.avatar || '',
+            bio: cloudMatch.bio || '',
+            savedState: {
+              favorites: cloudMatch.favorites || [],
+              cart: cloudMatch.cart || [],
+              orders: cloudMatch.orders || []
+            }
+          }
+        : localMatch;
+
+      if (existing) {
+        await onCompleteAuth(
+          {
+            ...existing,
+            avatar: googleUser.avatar || existing.avatar,
+            googleSub: googleUser.googleSub,
+            authProvider: 'google',
+            emailVerified: true,
+            accessToken: googleUser.accessToken
+          },
+          false
+        );
+      } else {
+        setPendingGoogleProfile(googleUser);
+        setOnboardName(googleUser.name || '');
+        setOnboardLocation('');
+        setOnboardBio('Verified Gmail member • SoleSyndicate community');
+        setMode('google-onboard');
+      }
+    } catch (err) {
+      setError(err.message || 'Google authentication failed.');
+    } finally {
+      setIsLoadingGoogle(false);
+    }
+  };
+
+  const handleFinishGoogleRegistration = async (e) => {
+    e.preventDefault();
+    if (!pendingGoogleProfile) return;
+    if (!onboardName.trim() || !onboardLocation.trim()) {
+      setError('Please enter your display name and city/location.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    await onCompleteAuth(
+      {
+        id: `user_${Date.now()}`,
+        googleSub: pendingGoogleProfile.googleSub,
+        authProvider: 'google',
+        emailVerified: pendingGoogleProfile.emailVerified,
+        name: onboardName.trim(),
+        email: pendingGoogleProfile.email.trim().toLowerCase(),
+        location: onboardLocation.trim(),
+        role: 'Buyer & Seller',
+        avatar: pendingGoogleProfile.avatar || '',
+        bio:
+          onboardBio.trim() ||
+          'Verified Gmail member • SoleSyndicate community',
+        accessToken: pendingGoogleProfile.accessToken,
+        createdAt: new Date().toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric'
+        })
+      },
+      true
+    );
+    setIsSubmitting(false);
+  };
+
+  const handleManualLogin = async (e) => {
+    e.preventDefault();
+    setError('');
+    setIsSubmitting(true);
+    try {
+      const cleanEmail = email.trim().toLowerCase();
+      let matched = registeredUsers.find(
+        (u) => u.email.toLowerCase() === cleanEmail
+      );
+
+      if (!matched && isSupabaseConfigured) {
+        const cloudProfile = await fetchUserAccountFromSupabase(cleanEmail);
+        if (cloudProfile) {
+          matched = {
+            id: `user_${cleanEmail}`,
+            googleSub: cloudProfile.google_sub,
+            authProvider: cloudProfile.auth_provider || 'gmail-form',
+            emailVerified: Boolean(cloudProfile.email_verified),
+            name: cloudProfile.name,
+            email: cleanEmail,
+            password: cloudProfile.password,
+            location: cloudProfile.location || '',
+            role: cloudProfile.role || 'Buyer & Seller',
+            avatar: cloudProfile.avatar || '',
+            bio: cloudProfile.bio || '',
+            savedState: {
+              favorites: cloudProfile.favorites || [],
+              cart: cloudProfile.cart || [],
+              orders: cloudProfile.orders || []
+            }
+          };
+        }
+      }
+
+      if (!matched) {
+        setError(
+          'No account found for that Gmail address. Switch to Register or continue with Google.'
+        );
+        return;
+      }
+      if (matched.authProvider === 'google' && !matched.password) {
+        setError(
+          'This Gmail account uses Google Sign-In. Click "Continue with Google (Gmail API)" above.'
+        );
+        return;
+      }
+      if (matched.password !== password) {
+        setError('Incorrect password. Please try again.');
+        return;
+      }
+
+      await onCompleteAuth(matched, false);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleManualRegister = async (e) => {
+    e.preventDefault();
+    setError('');
+    const cleanName = fullName.trim();
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanLocation = location.trim();
+
+    if (!cleanName || !cleanEmail || !cleanLocation) {
+      setError('Please complete your name, Gmail address, and location.');
+      return;
+    }
+    if (!cleanEmail.endsWith('@gmail.com')) {
+      setError('Please enter a valid @gmail.com address.');
+      return;
+    }
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const existsLocally = registeredUsers.some(
+        (u) => u.email.toLowerCase() === cleanEmail
+      );
+      const existsInCloud = isSupabaseConfigured
+        ? Boolean(await fetchUserAccountFromSupabase(cleanEmail))
+        : false;
+
+      if (existsLocally || existsInCloud) {
+        setError('An account with this Gmail already exists. Please Log In.');
+        return;
+      }
+
+      await onCompleteAuth(
+        {
+          id: `user_${Date.now()}`,
+          authProvider: 'gmail-form',
+          emailVerified: false,
+          name: cleanName,
+          email: cleanEmail,
+          password,
+          location: cleanLocation,
+          role,
+          avatar: '',
+          bio: `${role} • ${cleanLocation}`,
+          createdAt: new Date().toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric'
+          })
+        },
+        true
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      className="qv-backdrop"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="SoleSyndicate Account Authentication"
+    >
+      <div className="auth-modal" onClick={(e) => e.stopPropagation()}>
+        <button
+          type="button"
+          className="qv-close"
+          aria-label="Close authentication modal"
+          onClick={onClose}
+        >
+          ✕
+        </button>
+
+        <div className="auth-brand-top">
+          <div className="auth-brand-mark">
+            SoleSyndicate<span>.</span>
+          </div>
+          <span className="auth-api-pill">● Google OAuth API Ready</span>
+        </div>
+
+        {mode !== 'google-onboard' && (
+          <div className="auth-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'login'}
+              className={`auth-tab-btn ${mode === 'login' ? 'active' : ''}`}
+              onClick={() => {
+                setMode('login');
+                setError('');
+              }}
+            >
+              Log In
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === 'register'}
+              className={`auth-tab-btn ${mode === 'register' ? 'active' : ''}`}
+              onClick={() => {
+                setMode('register');
+                setError('');
+              }}
+            >
+              Register
+            </button>
+          </div>
+        )}
+
+        {mode === 'google-onboard' && pendingGoogleProfile ? (
+          <>
+            <h2 className="auth-heading">Complete Gmail Registration</h2>
+            <p className="auth-subcopy">
+              Your Gmail identity was verified via Google API. Confirm your
+              member profile to start buying and listing sneakers.
+            </p>
+
+            <div className="google-onboard-card">
+              {pendingGoogleProfile.avatar ? (
+                <img
+                  src={pendingGoogleProfile.avatar}
+                  alt={pendingGoogleProfile.name}
+                />
+              ) : (
+                <div className="seller-mini-initials">
+                  {getInitials(pendingGoogleProfile.name)}
+                </div>
+              )}
+              <div>
+                <span className="google-onboard-badge">
+                  ✓ VERIFIED GMAIL ACCOUNT
+                </span>
+                <div className="google-onboard-email">
+                  {pendingGoogleProfile.email}
+                </div>
+              </div>
+            </div>
+
+            {error && (
+              <div className="auth-error-banner" style={{ marginBottom: 12 }}>
+                {error}
+              </div>
+            )}
+
+            <form
+              className="auth-form"
+              onSubmit={handleFinishGoogleRegistration}
+            >
+              <div className="auth-field">
+                <label htmlFor="onboard-name">DISPLAY NAME *</label>
+                <input
+                  id="onboard-name"
+                  type="text"
+                  required
+                  value={onboardName}
+                  onChange={(e) => setOnboardName(e.target.value)}
+                />
+              </div>
+
+              <div className="auth-field">
+                <label htmlFor="onboard-location">CITY / LOCATION *</label>
+                <input
+                  id="onboard-location"
+                  type="text"
+                  required
+                  value={onboardLocation}
+                  onChange={(e) => setOnboardLocation(e.target.value)}
+                  placeholder="e.g. Digos City, Davao Region"
+                />
+              </div>
+
+              <div className="auth-field">
+                <label htmlFor="onboard-bio">MEMBER / SELLER BIO</label>
+                <textarea
+                  id="onboard-bio"
+                  rows={2}
+                  value={onboardBio}
+                  onChange={(e) => setOnboardBio(e.target.value)}
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="auth-submit-btn"
+                disabled={isSubmitting}
+              >
+                {isSubmitting
+                  ? 'Creating Account...'
+                  : 'Finish Registration & Enter Storefront →'}
+              </button>
+            </form>
+          </>
+        ) : (
+          <>
+            <h2 className="auth-heading">
+              {mode === 'login'
+                ? 'Welcome Back to SoleSyndicate'
+                : 'Create Your SoleSyndicate Account'}
+            </h2>
+            <p className="auth-subcopy">
+              {mode === 'login'
+                ? 'Log in to restore your saved wishlist, bag, listings, and messages.'
+                : 'Register a new account with a clean slate—all progress saves automatically.'}
+            </p>
+
+            <button
+              type="button"
+              className="google-oauth-btn"
+              disabled={isLoadingGoogle}
+              onClick={handleGoogleOAuthClick}
+            >
+              <GoogleGIcon />
+              <span>
+                {isLoadingGoogle
+                  ? 'Connecting to Google API...'
+                  : mode === 'login'
+                  ? 'Continue with Google (Gmail API)'
+                  : 'Register with Google (Gmail API)'}
+              </span>
+            </button>
+
+            <div className="auth-divider">
+              <span>
+                {mode === 'login'
+                  ? 'OR LOG IN WITH GMAIL & PASSWORD'
+                  : 'OR REGISTER WITH GMAIL FORM'}
+              </span>
+            </div>
+
+            {error && (
+              <div className="auth-error-banner" style={{ marginBottom: 12 }}>
+                {error}
+              </div>
+            )}
+
+            {mode === 'login' ? (
+              <form className="auth-form" onSubmit={handleManualLogin}>
+                <div className="auth-field">
+                  <label htmlFor="login-email">GMAIL ADDRESS *</label>
+                  <input
+                    id="login-email"
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@gmail.com"
+                  />
+                </div>
+
+                <div className="auth-field">
+                  <label htmlFor="login-password">PASSWORD *</label>
+                  <input
+                    id="login-password"
+                    type="password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  className="auth-submit-btn"
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting
+                    ? 'Loading Your Account...'
+                    : 'Log In to SoleSyndicate →'}
+                </button>
+              </form>
+            ) : (
+              <form className="auth-form" onSubmit={handleManualRegister}>
+                <div className="auth-field">
+                  <label htmlFor="reg-name">FULL NAME *</label>
+                  <input
+                    id="reg-name"
+                    type="text"
+                    required
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    placeholder="e.g. Simon Cruz"
+                  />
+                </div>
+
+                <div className="auth-field">
+                  <label htmlFor="reg-email">GMAIL ADDRESS *</label>
+                  <input
+                    id="reg-email"
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="you@gmail.com"
+                  />
+                </div>
+
+                <div className="sell-row-2">
+                  <div className="auth-field">
+                    <label htmlFor="reg-location">CITY / LOCATION *</label>
+                    <input
+                      id="reg-location"
+                      type="text"
+                      required
+                      value={location}
+                      onChange={(e) => setLocation(e.target.value)}
+                      placeholder="Digos City, Davao"
+                    />
+                  </div>
+
+                  <div className="auth-field">
+                    <label htmlFor="reg-role">ACCOUNT ROLE</label>
+                    <select
+                      id="reg-role"
+                      value={role}
+                      onChange={(e) => setRole(e.target.value)}
+                    >
+                      <option value="Buyer & Seller">Buyer &amp; Seller</option>
+                      <option value="Sneaker Buyer">Sneaker Buyer</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="auth-field">
+                  <label htmlFor="reg-password">CREATE PASSWORD *</label>
+                  <input
+                    id="reg-password"
+                    type="password"
+                    minLength={6}
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Minimum 6 characters"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  className="auth-submit-btn"
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting
+                    ? 'Creating Fresh Account...'
+                    : 'Create Account with Gmail →'}
+                </button>
+              </form>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AccountHubModal({
+  user,
+  userListings,
+  orders,
+  favoritesCount,
+  onClose,
+  onUpdateProfile,
+  onDeleteListing,
+  onOpenSellModal,
+  onSignOut
+}) {
+  const [activeTab, setActiveTab] = useState('profile');
+  const [nameDraft, setNameDraft] = useState(user.name || '');
+  const [locationDraft, setLocationDraft] = useState(user.location || '');
+  const [bioDraft, setBioDraft] = useState(user.bio || '');
+  const [savedNotice, setSavedNotice] = useState(false);
+
+  const handleSaveProfile = (e) => {
+    e.preventDefault();
+    onUpdateProfile({
+      ...user,
+      name: nameDraft.trim() || user.name,
+      location: locationDraft.trim() || user.location,
+      bio: bioDraft.trim()
+    });
+    setSavedNotice(true);
+    setTimeout(() => setSavedNotice(false), 3000);
+  };
+
+  return (
+    <div
+      className="qv-backdrop"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Member Account Hub"
+    >
+      <div className="profile-modal" onClick={(e) => e.stopPropagation()}>
+        <button
+          type="button"
+          className="qv-close"
+          aria-label="Close account hub"
+          onClick={onClose}
+        >
+          ✕
+        </button>
+
+        <div className="profile-banner-card">
+          <div className="profile-banner-avatar">
+            {user.avatar ? (
+              <img src={user.avatar} alt={user.name} />
+            ) : (
+              <span>{getInitials(user.name)}</span>
+            )}
+          </div>
+
+          <div className="profile-banner-info">
+            <div className="profile-banner-name-row">
+              <h2>{user.name}</h2>
+              {user.emailVerified && (
+                <span className="qv-verified-seller-pill">
+                  ✓ GOOGLE API VERIFIED
+                </span>
+              )}
+            </div>
+            <div className="profile-banner-meta">
+              <span>✉ {user.email}</span>
+              {user.location && <span>• 📍 {user.location}</span>}
+            </div>
+            {user.bio && <p className="profile-banner-bio">{user.bio}</p>}
+          </div>
+
+          <div className="profile-stats-row">
+            <div className="profile-stat-box">
+              <strong>{favoritesCount}</strong>
+              <span>Saved</span>
+            </div>
+            <div className="profile-stat-box">
+              <strong>{userListings.length}</strong>
+              <span>Listings</span>
+            </div>
+            <div className="profile-stat-box">
+              <strong>{orders.length}</strong>
+              <span>Orders</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="profile-tabs">
+          <button
+            type="button"
+            className={`profile-tab-btn ${
+              activeTab === 'profile' ? 'active' : ''
+            }`}
+            onClick={() => setActiveTab('profile')}
+          >
+            Account &amp; Profile
+          </button>
+          <button
+            type="button"
+            className={`profile-tab-btn ${
+              activeTab === 'listings' ? 'active' : ''
+            }`}
+            onClick={() => setActiveTab('listings')}
+          >
+            My Listings ({userListings.length})
+          </button>
+          <button
+            type="button"
+            className={`profile-tab-btn ${
+              activeTab === 'orders' ? 'active' : ''
+            }`}
+            onClick={() => setActiveTab('orders')}
+          >
+            Order History ({orders.length})
+          </button>
+        </div>
+
+        <div className="profile-tab-panel">
+          {activeTab === 'profile' && (
+            <form className="profile-edit-form" onSubmit={handleSaveProfile}>
+              {savedNotice && (
+                <div className="profile-saved-toast">
+                  ✓ Profile updated and saved to your account!
+                </div>
+              )}
+
+              <div className="sell-row-2">
+                <div className="auth-field">
+                  <label htmlFor="hub-name">DISPLAY NAME</label>
+                  <input
+                    id="hub-name"
+                    type="text"
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                  />
+                </div>
+                <div className="auth-field">
+                  <label htmlFor="hub-location">CITY / LOCATION</label>
+                  <input
+                    id="hub-location"
+                    type="text"
+                    value={locationDraft}
+                    onChange={(e) => setLocationDraft(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="auth-field">
+                <label htmlFor="hub-bio">BIO / MEETUP PREFERENCES</label>
+                <textarea
+                  id="hub-bio"
+                  rows={2}
+                  value={bioDraft}
+                  onChange={(e) => setBioDraft(e.target.value)}
+                />
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 10,
+                  marginTop: 6
+                }}
+              >
+                <button
+                  type="button"
+                  className="account-signout-btn"
+                  onClick={onSignOut}
+                >
+                  Save &amp; Sign Out
+                </button>
+                <button type="submit" className="sell-submit-btn">
+                  Save Profile Changes
+                </button>
+              </div>
+            </form>
+          )}
+
+          {activeTab === 'listings' && (
+            <>
+              {userListings.length === 0 ? (
+                <div className="profile-empty-box">
+                  <p>You haven&apos;t listed any sneakers yet.</p>
+                  <button
+                    type="button"
+                    className="sell-submit-btn"
+                    onClick={() => {
+                      onClose();
+                      onOpenSellModal();
+                    }}
+                  >
+                    + List Your First Pair
+                  </button>
+                </div>
+              ) : (
+                <div className="profile-items-list">
+                  {userListings.map((item) => (
+                    <div key={item.id} className="profile-list-card">
+                      <img src={item.image} alt={item.name} />
+                      <div className="profile-list-info">
+                        <span className="brand-pill">{item.brand}</span>
+                        <h4>{item.name}</h4>
+                        <p>
+                          ${item.price} • Sizes: {(item.options || []).join(', ')}
+                        </p>
+                      </div>
+                      <div className="profile-list-actions">
+                        <button
+                          type="button"
+                          className="account-signout-btn"
+                          onClick={() => onDeleteListing(item.id)}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          {activeTab === 'orders' && (
+            <>
+              {orders.length === 0 ? (
+                <div className="profile-empty-box">
+                  <p>No orders placed under {user.email} yet.</p>
+                </div>
+              ) : (
+                <div className="profile-items-list">
+                  {orders.map((order) => (
+                    <div key={order.id} className="profile-order-card">
+                      <div className="profile-order-top">
+                        <strong>Order #{order.id}</strong>
+                        <strong>${order.total}</strong>
+                      </div>
+                      <div className="profile-order-meta">
+                        <span>{order.date}</span>
+                        <span>• Delivered to {user.email}</span>
+                      </div>
+                      <div className="profile-order-items">
+                        {order.items.map((it, i) => (
+                          <span key={i} className="profile-order-chip">
+                            {it.qty}× {it.name} ({it.selectedOption})
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =========================================================
+// STOREFRONT CATALOG & DATA
+// =========================================================
 const HERO_SHOE_SLIDES = [
   {
     id: 'nike-crimson',
@@ -873,8 +1852,45 @@ const DEFAULT_SHOE_PREVIEW =
   'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=800&q=85';
 
 const STORAGE_LISTINGS_KEY = 'solesyndicate_user_listings_v1';
-const STORAGE_SELLER_KEY = 'solesyndicate_seller_profile_v1';
-const STORAGE_CHATS_KEY = 'solesyndicate_chats_v1';
+const STORAGE_USERS_KEY = 'solesyndicate_users_v1';
+const STORAGE_SESSION_KEY = 'solesyndicate_session_v1';
+const STORAGE_ACCOUNT_DATA_PREFIX = 'solesyndicate_account_data_';
+
+function loadLocalAccountData(email) {
+  if (!email) {
+    return { favorites: [], cart: [], orders: [] };
+  }
+  try {
+    const raw = localStorage.getItem(
+      `${STORAGE_ACCOUNT_DATA_PREFIX}${email.trim().toLowerCase()}`
+    );
+    if (!raw) return { favorites: [], cart: [], orders: [] };
+    const parsed = JSON.parse(raw);
+    return {
+      favorites: Array.isArray(parsed.favorites) ? parsed.favorites : [],
+      cart: Array.isArray(parsed.cart) ? parsed.cart : [],
+      orders: Array.isArray(parsed.orders) ? parsed.orders : []
+    };
+  } catch {
+    return { favorites: [], cart: [], orders: [] };
+  }
+}
+
+function saveLocalAccountData(email, data) {
+  if (!email) return;
+  try {
+    localStorage.setItem(
+      `${STORAGE_ACCOUNT_DATA_PREFIX}${email.trim().toLowerCase()}`,
+      JSON.stringify({
+        favorites: data.favorites || [],
+        cart: data.cart || [],
+        orders: data.orders || []
+      })
+    );
+  } catch {
+    // Ignore storage quota warnings
+  }
+}
 
 const FREE_SHIPPING_THRESHOLD = 150;
 
@@ -895,11 +1911,61 @@ export default function App() {
   const [wishlistOnly, setWishlistOnly] = useState(false);
   const [selectedBrands, setSelectedBrands] = useState([]);
   const [sortBy, setSortBy] = useState('featured');
-  const [cart, setCart] = useState([]);
-  const [favorites, setFavorites] = useState([1, 2]);
   const [showCart, setShowCart] = useState(false);
 
-  // Community user-created sneaker listings persisted in localStorage
+  // Gmail / Google OAuth 2.0 Authentication & Per-Account State
+  const [registeredUsers, setRegisteredUsers] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_USERS_KEY) || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_SESSION_KEY) || 'null');
+    } catch {
+      return null;
+    }
+  });
+
+  // Per-account Bag, Saved Wishlist, and Order History (resets on logout / new account, restores on old account login)
+  const [cart, setCart] = useState(() => {
+    try {
+      const savedUser = JSON.parse(
+        localStorage.getItem(STORAGE_SESSION_KEY) || 'null'
+      );
+      return savedUser ? loadLocalAccountData(savedUser.email).cart : [];
+    } catch {
+      return [];
+    }
+  });
+  const [favorites, setFavorites] = useState(() => {
+    try {
+      const savedUser = JSON.parse(
+        localStorage.getItem(STORAGE_SESSION_KEY) || 'null'
+      );
+      return savedUser ? loadLocalAccountData(savedUser.email).favorites : [];
+    } catch {
+      return [];
+    }
+  });
+  const [orders, setOrders] = useState(() => {
+    try {
+      const savedUser = JSON.parse(
+        localStorage.getItem(STORAGE_SESSION_KEY) || 'null'
+      );
+      return savedUser ? loadLocalAccountData(savedUser.email).orders : [];
+    } catch {
+      return [];
+    }
+  });
+  const [isAccountHydrated, setIsAccountHydrated] = useState(true);
+
+  const [authModalMode, setAuthModalMode] = useState(null);
+  const [showAccountHub, setShowAccountHub] = useState(false);
+
+  // Community seller listings (visible to all users, deletable only by seller)
   const [userListings, setUserListings] = useState(() => {
     try {
       const saved = localStorage.getItem(STORAGE_LISTINGS_KEY);
@@ -908,42 +1974,22 @@ export default function App() {
       return [];
     }
   });
+  const [isPublishing, setIsPublishing] = useState(false);
 
-  // Seller Chat Drawer & Conversation Threads persisted in localStorage
-  const [chatProduct, setChatProduct] = useState(null);
-  const [chatThreads, setChatThreads] = useState(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_CHATS_KEY);
-      return saved ? JSON.parse(saved) : {};
-    } catch {
-      return {};
-    }
-  });
+  // Real User-to-User Chat Drawer & Conversation Threads (NO automatic bot replies)
+  const [chatThreads, setChatThreads] = useState({});
+  const [activeThreadKey, setActiveThreadKey] = useState(null);
+  const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
+  const [waitingSellerProduct, setWaitingSellerProduct] = useState(null);
   const [chatInput, setChatInput] = useState('');
-  const [isSellerTyping, setIsSellerTyping] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const chatMessagesEndRef = useRef(null);
 
   // Sell / List a Product Modal & Form State
   const [showSellModal, setShowSellModal] = useState(false);
+  const [pendingOpenSell, setPendingOpenSell] = useState(false);
+  const [pendingChatProduct, setPendingChatProduct] = useState(null);
   const [listingToast, setListingToast] = useState('');
-
-  const [savedSeller, setSavedSeller] = useState(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_SELLER_KEY);
-      return raw
-        ? JSON.parse(raw)
-        : { name: '', location: '', avatar: '', bio: '' };
-    } catch {
-      return { name: '', location: '', avatar: '', bio: '' };
-    }
-  });
-
-  const [sellerName, setSellerName] = useState(savedSeller.name || '');
-  const [sellerLocation, setSellerLocation] = useState(
-    savedSeller.location || ''
-  );
-  const [sellerAvatar, setSellerAvatar] = useState(savedSeller.avatar || '');
-  const [sellerBio, setSellerBio] = useState(savedSeller.bio || '');
 
   const [shoeBrand, setShoeBrand] = useState('NIKE');
   const [customBrand, setCustomBrand] = useState('');
@@ -957,16 +2003,15 @@ export default function App() {
   const [shoeSizes, setShoeSizes] = useState(['US 9', 'US 10']);
   const [shoeDescription, setShoeDescription] = useState('');
   const [shoeImage, setShoeImage] = useState('');
+  const [shoeImageFile, setShoeImageFile] = useState(null);
   const [shoeImageUrlInput, setShoeImageUrlInput] = useState('');
   const [sellFormError, setSellFormError] = useState('');
 
-  // Combine user-listed products with default catalog
   const allProducts = useMemo(
     () => [...userListings, ...DEFAULT_PRODUCTS],
     [userListings]
   );
 
-  // Randomized 6-slide hero deck
   const [heroSlides, setHeroSlides] = useState(() =>
     shuffleSlides(HERO_SHOE_SLIDES)
   );
@@ -997,6 +2042,402 @@ export default function App() {
   const activeSlide = heroSlides[slideIndex] || heroSlides[0];
   const slideNumberLabel = String(slideIndex + 1).padStart(2, '0');
 
+  // 1. Load & subscribe to all seller listings in Supabase
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+
+    let cancelled = false;
+
+    const loadAllListings = () => {
+      fetchListingsFromSupabase()
+        .then((rows) => {
+          if (!cancelled) {
+            setUserListings(rows);
+          }
+        })
+        .catch((err) => {
+          console.error('Supabase fetch error:', err.message);
+        });
+    };
+
+    loadAllListings();
+    const unsubscribe = subscribeToListings(loadAllListings);
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  // 2. Load & subscribe to REAL user-to-user messages for the logged-in user
+  useEffect(() => {
+    if (!currentUser?.email) {
+      setChatThreads({});
+      setActiveThreadKey(null);
+      setIsChatDrawerOpen(false);
+      return;
+    }
+
+    if (!isSupabaseConfigured) return;
+
+    let cancelled = false;
+    const syncMessages = () => {
+      fetchUserMessagesFromSupabase(currentUser.email)
+        .then((rows) => {
+          if (cancelled) return;
+          const grouped = groupMessageRowsIntoThreads(rows);
+          setChatThreads((prev) => {
+            // Preserve any newly opened empty draft thread while merging live DB messages
+            const merged = { ...grouped };
+            Object.keys(prev).forEach((k) => {
+              if (!merged[k] && prev[k]?.messages?.length === 0) {
+                merged[k] = prev[k];
+              }
+            });
+            return merged;
+          });
+        })
+        .catch((err) => {
+          console.error('Messages fetch error:', err.message);
+        });
+    };
+
+    syncMessages();
+    const unsubscribe = subscribeToUserMessages(currentUser.email, syncMessages);
+    const pollInterval = setInterval(syncMessages, 4000);
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      clearInterval(pollInterval);
+    };
+  }, [currentUser?.email]);
+
+  // 3. Auto-save logged-in user's Bag, Saved Wishlist, and Orders whenever they change
+  useEffect(() => {
+    if (!currentUser?.email || !isAccountHydrated) return;
+
+    const stateSnapshot = { favorites, cart, orders };
+    saveLocalAccountData(currentUser.email, stateSnapshot);
+
+    if (isSupabaseConfigured) {
+      saveUserAccountToSupabase(currentUser, stateSnapshot);
+    }
+  }, [currentUser, favorites, cart, orders, isAccountHydrated]);
+
+  // 4. Hydrate old account data from Supabase on page refresh if signed in
+  useEffect(() => {
+    if (!currentUser?.email || !isSupabaseConfigured) return;
+    let cancelled = false;
+
+    fetchUserAccountFromSupabase(currentUser.email).then((cloudRow) => {
+      if (cancelled || !cloudRow) return;
+      const localData = loadLocalAccountData(currentUser.email);
+      const nextFavs =
+        Array.isArray(cloudRow.favorites) && cloudRow.favorites.length > 0
+          ? cloudRow.favorites
+          : localData.favorites;
+      const nextCart =
+        Array.isArray(cloudRow.cart) && cloudRow.cart.length > 0
+          ? cloudRow.cart
+          : localData.cart;
+      const nextOrders =
+        Array.isArray(cloudRow.orders) && cloudRow.orders.length > 0
+          ? cloudRow.orders
+          : localData.orders;
+
+      setFavorites(nextFavs);
+      setCart(nextCart);
+      setOrders(nextOrders);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const openSellPortal = () => {
+    if (!currentUser) {
+      setPendingOpenSell(true);
+      setAuthModalMode('login');
+      return;
+    }
+    setShowSellModal(true);
+  };
+
+  // Start or open a REAL buyer-seller message thread (requires login, NO bot replies)
+  const startConversationForProduct = (product, loggedInUser = currentUser) => {
+    if (!product || !loggedInUser?.email) return;
+
+    const myEmail = loggedInUser.email.trim().toLowerCase();
+    const seller = getProductSeller(product);
+    const sellerEmail = (
+      product.ownerEmail || 'concierge@solesyndicate.com'
+    )
+      .trim()
+      .toLowerCase();
+
+    setQuickViewProduct(null);
+    setShowCart(false);
+    setChatInput('');
+
+    // Case A: The logged-in user IS the seller of this product
+    if (myEmail === sellerEmail) {
+      const matchingBuyerThreads = Object.values(chatThreads).filter(
+        (t) => t.listingId === String(product.id)
+      );
+
+      if (matchingBuyerThreads.length > 0) {
+        const latestThread =
+          matchingBuyerThreads[matchingBuyerThreads.length - 1];
+        setWaitingSellerProduct(null);
+        setActiveThreadKey(latestThread.threadKey);
+        setIsChatDrawerOpen(true);
+      } else {
+        setActiveThreadKey(null);
+        setWaitingSellerProduct(product);
+        setIsChatDrawerOpen(true);
+      }
+      return;
+    }
+
+    // Case B: The logged-in user is a BUYER messaging the seller
+    const key = buildThreadKey(product.id, myEmail);
+    setWaitingSellerProduct(null);
+
+    setChatThreads((prev) => {
+      if (prev[key]) return prev;
+      return {
+        ...prev,
+        [key]: {
+          threadKey: key,
+          listingId: String(product.id),
+          listingName: product.name,
+          listingImage: product.image,
+          listingPrice: product.price,
+          sellerEmail,
+          sellerName: seller.name,
+          buyerEmail: myEmail,
+          buyerName: loggedInUser.name || myEmail.split('@')[0],
+          messages: []
+        }
+      };
+    });
+
+    setActiveThreadKey(key);
+    setIsChatDrawerOpen(true);
+  };
+
+  const openChatWithSeller = (product) => {
+    const targetProduct = product || allProducts[0];
+    if (!targetProduct) return;
+
+    if (!currentUser) {
+      setPendingChatProduct(targetProduct);
+      setAuthModalMode('login');
+      return;
+    }
+
+    startConversationForProduct(targetProduct, currentUser);
+  };
+
+  const openMessagesInbox = () => {
+    if (!currentUser) {
+      setAuthModalMode('login');
+      return;
+    }
+
+    const threads = Object.values(chatThreads);
+    if (threads.length > 0) {
+      const latest = threads[threads.length - 1];
+      setWaitingSellerProduct(null);
+      setActiveThreadKey(latest.threadKey);
+      setIsChatDrawerOpen(true);
+    } else {
+      setActiveThreadKey(null);
+      setWaitingSellerProduct(null);
+      setIsChatDrawerOpen(true);
+    }
+  };
+
+  const handleCompleteAuth = async (userObj, isNewRegistration) => {
+    setIsAccountHydrated(false);
+    const cleanEmail = userObj.email.trim().toLowerCase();
+    const normalizedUser = { ...userObj, email: cleanEmail };
+
+    setRegisteredUsers((prev) => {
+      const filtered = prev.filter(
+        (u) => u.email.toLowerCase() !== cleanEmail
+      );
+      const next = [normalizedUser, ...filtered];
+      try {
+        localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+
+    // Reset transient UI state (filters, promo codes, open drawers)
+    setAppliedPromo('');
+    setPromoInput('');
+    setPromoError('');
+    setWishlistOnly(false);
+    setSelectedBrands([]);
+    setCategory('All');
+    setQuery('');
+    setChatThreads({});
+    setActiveThreadKey(null);
+    setIsChatDrawerOpen(false);
+    setWaitingSellerProduct(null);
+
+    if (isNewRegistration) {
+      // NEW ACCOUNT: Reset everything to a fresh empty state
+      const freshState = { favorites: [], cart: [], orders: [] };
+      setFavorites([]);
+      setCart([]);
+      setOrders([]);
+      saveLocalAccountData(cleanEmail, freshState);
+
+      if (isSupabaseConfigured) {
+        await saveUserAccountToSupabase(normalizedUser, freshState);
+      }
+    } else {
+      // OLD ACCOUNT: Restore everything saved before the user logged out
+      let restored = loadLocalAccountData(cleanEmail);
+
+      if (userObj.savedState) {
+        restored = {
+          favorites: userObj.savedState.favorites || restored.favorites,
+          cart: userObj.savedState.cart || restored.cart,
+          orders: userObj.savedState.orders || restored.orders
+        };
+      } else if (isSupabaseConfigured) {
+        const cloudRow = await fetchUserAccountFromSupabase(cleanEmail);
+        if (cloudRow) {
+          restored = {
+            favorites: Array.isArray(cloudRow.favorites)
+              ? cloudRow.favorites
+              : restored.favorites,
+            cart: Array.isArray(cloudRow.cart) ? cloudRow.cart : restored.cart,
+            orders: Array.isArray(cloudRow.orders)
+              ? cloudRow.orders
+              : restored.orders
+          };
+        }
+      }
+
+      setFavorites(restored.favorites);
+      setCart(restored.cart);
+      setOrders(restored.orders);
+      saveLocalAccountData(cleanEmail, restored);
+    }
+
+    setCurrentUser(normalizedUser);
+    try {
+      localStorage.setItem(
+        STORAGE_SESSION_KEY,
+        JSON.stringify(normalizedUser)
+      );
+    } catch {
+      // Ignore storage errors
+    }
+    setIsAccountHydrated(true);
+    setAuthModalMode(null);
+
+    if (pendingOpenSell) {
+      setPendingOpenSell(false);
+      setShowSellModal(true);
+    } else if (pendingChatProduct) {
+      const targetProd = pendingChatProduct;
+      setPendingChatProduct(null);
+      startConversationForProduct(targetProd, normalizedUser);
+    }
+
+    setListingToast(
+      isNewRegistration
+        ? `New account created for ${normalizedUser.name}! Starting fresh.`
+        : `Welcome back, ${normalizedUser.name}! Your saved items, bag, and messages are restored.`
+    );
+    setTimeout(() => setListingToast(''), 5500);
+  };
+
+  const handleUpdateUserProfile = async (updatedUser) => {
+    setCurrentUser(updatedUser);
+    try {
+      localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(updatedUser));
+    } catch {
+      // Ignore storage errors
+    }
+    setRegisteredUsers((prev) => {
+      const next = prev.map((u) =>
+        u.email.toLowerCase() === updatedUser.email.toLowerCase()
+          ? updatedUser
+          : u
+      );
+      try {
+        localStorage.setItem(STORAGE_USERS_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+
+    if (isSupabaseConfigured) {
+      await saveUserAccountToSupabase(updatedUser, {
+        favorites,
+        cart,
+        orders
+      });
+    }
+  };
+
+  const handleSignOut = async () => {
+    // 1. Persist everything the user did before logging out
+    if (currentUser?.email) {
+      const snapshot = { favorites, cart, orders };
+      saveLocalAccountData(currentUser.email, snapshot);
+      if (isSupabaseConfigured) {
+        await saveUserAccountToSupabase(currentUser, snapshot);
+      }
+    }
+
+    if (currentUser?.accessToken) {
+      signOutGoogleSession(currentUser.accessToken);
+    }
+
+    // 2. Reset all active session state for the next visitor / new account
+    setIsAccountHydrated(false);
+    setCurrentUser(null);
+    setFavorites([]);
+    setCart([]);
+    setOrders([]);
+    setChatThreads({});
+    setActiveThreadKey(null);
+    setIsChatDrawerOpen(false);
+    setWaitingSellerProduct(null);
+    setAppliedPromo('');
+    setPromoInput('');
+    setPromoError('');
+    setWishlistOnly(false);
+    setSelectedBrands([]);
+    setCategory('All');
+    setQuery('');
+    setShowAccountHub(false);
+    setShowSellModal(false);
+    setShowCart(false);
+
+    try {
+      localStorage.removeItem(STORAGE_SESSION_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+
+    setIsAccountHydrated(true);
+    setListingToast('Saved your progress and signed out.');
+    setTimeout(() => setListingToast(''), 4000);
+  };
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_LISTINGS_KEY, JSON.stringify(userListings));
@@ -1006,18 +2447,10 @@ export default function App() {
   }, [userListings]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_CHATS_KEY, JSON.stringify(chatThreads));
-    } catch {
-      // Ignore storage quota warnings
-    }
-  }, [chatThreads]);
-
-  useEffect(() => {
-    if (chatProduct && chatMessagesEndRef.current) {
+    if (isChatDrawerOpen && chatMessagesEndRef.current) {
       chatMessagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [chatProduct, chatThreads, isSellerTyping]);
+  }, [isChatDrawerOpen, activeThreadKey, chatThreads]);
 
   useEffect(() => {
     const measureHeader = () => {
@@ -1117,121 +2550,95 @@ export default function App() {
     setQuickViewProduct(null);
   };
 
-  // Open Seller Chat Drawer for any product
-  const openChatWithSeller = (product) => {
-    const targetProduct = product || allProducts[0];
-    if (!targetProduct) return;
-
-    const seller = getProductSeller(targetProduct);
-    setQuickViewProduct(null);
-    setShowCart(false);
-    setChatInput('');
-    setIsSellerTyping(false);
-
-    setChatThreads((prev) => {
-      if (prev[targetProduct.id]) {
-        return {
-          ...prev,
-          [targetProduct.id]: {
-            ...prev[targetProduct.id],
-            product: targetProduct
-          }
-        };
-      }
-      return {
-        ...prev,
-        [targetProduct.id]: {
-          product: targetProduct,
-          messages: [
-            {
-              id: Date.now(),
-              sender: 'seller',
-              text: `Hi! I'm ${seller.name} from ${seller.location}. Ask me anything about sizing, condition, or meetup/shipping for the ${targetProduct.name}!`,
-              time: formatChatTime()
-            }
-          ]
-        }
-      };
-    });
-
-    setChatProduct(targetProduct);
-  };
-
-  const openMessagesInbox = () => {
-    const existingThreads = Object.values(chatThreads);
-    if (existingThreads.length > 0) {
-      const latest = existingThreads[existingThreads.length - 1].product;
-      openChatWithSeller(latest);
-    } else if (allProducts[0]) {
-      openChatWithSeller(allProducts[0]);
-    }
-  };
-
-  const sendChatMessage = (rawText) => {
+  // Send a REAL message to the other user (NO automatic bot reply)
+  const sendChatMessage = async (rawText) => {
     const trimmed = rawText.trim();
-    if (!trimmed || !chatProduct) return;
+    if (!trimmed || !activeThreadKey || !currentUser || isSendingMessage) return;
 
-    const currentProd = chatProduct;
-    const userMsg = {
-      id: Date.now(),
-      sender: 'buyer',
-      text: trimmed,
-      time: formatChatTime()
-    };
+    const currentThread = chatThreads[activeThreadKey];
+    if (!currentThread) return;
 
-    setChatThreads((prev) => {
-      const existing = prev[currentProd.id] || {
-        product: currentProd,
-        messages: []
-      };
-      return {
-        ...prev,
-        [currentProd.id]: {
-          product: currentProd,
-          messages: [...existing.messages, userMsg]
-        }
-      };
-    });
+    const myEmail = currentUser.email.trim().toLowerCase();
+    const myName = currentUser.name || myEmail.split('@')[0];
 
+    setIsSendingMessage(true);
     setChatInput('');
-    setIsSellerTyping(true);
 
-    setTimeout(() => {
-      const replyText = buildSellerReply(trimmed, currentProd);
-      const sellerMsg = {
-        id: Date.now() + 1,
-        sender: 'seller',
-        text: replyText,
-        time: formatChatTime()
+    try {
+      const savedRow = await sendMessageInSupabase({
+        listing_id: currentThread.listingId,
+        listing_name: currentThread.listingName,
+        listing_image: currentThread.listingImage,
+        listing_price: currentThread.listingPrice,
+        seller_email: currentThread.sellerEmail,
+        seller_name: currentThread.sellerName,
+        buyer_email: currentThread.buyerEmail,
+        buyer_name: currentThread.buyerName,
+        sender_email: myEmail,
+        sender_name: myName,
+        message_text: trimmed
+      });
+
+      const newMsgObj = {
+        id: savedRow.id,
+        senderEmail: myEmail,
+        senderName: myName,
+        text: trimmed,
+        time: formatMessageTimestamp(savedRow.created_at),
+        createdAt: savedRow.created_at
       };
 
       setChatThreads((prev) => {
-        const existing = prev[currentProd.id];
-        if (!existing) return prev;
+        const existing = prev[activeThreadKey] || currentThread;
+        const alreadyPresent = existing.messages.some(
+          (m) => m.id === newMsgObj.id
+        );
         return {
           ...prev,
-          [currentProd.id]: {
+          [activeThreadKey]: {
             ...existing,
-            messages: [...existing.messages, sellerMsg]
+            messages: alreadyPresent
+              ? existing.messages
+              : [...existing.messages, newMsgObj]
           }
         };
       });
-      setIsSellerTyping(false);
-    }, 850);
+    } catch (err) {
+      setListingToast(err.message || 'Unable to send message.');
+      setTimeout(() => setListingToast(''), 4000);
+    } finally {
+      setIsSendingMessage(false);
+    }
   };
 
-  const deleteChatThread = (productId) => {
-    const updated = { ...chatThreads };
-    delete updated[productId];
-    setChatThreads(updated);
+  const deleteChatThread = async (threadKeyToRemove) => {
+    const target = chatThreads[threadKeyToRemove];
+    if (!target) return;
 
-    if (chatProduct?.id === productId) {
-      const remainingThreads = Object.values(updated);
-      if (remainingThreads.length > 0) {
-        setChatProduct(remainingThreads[remainingThreads.length - 1].product);
-      } else {
-        setChatProduct(null);
+    try {
+      if (isSupabaseConfigured) {
+        await deleteConversationInSupabase(
+          target.listingId,
+          target.buyerEmail
+        );
       }
+
+      const updated = { ...chatThreads };
+      delete updated[threadKeyToRemove];
+      setChatThreads(updated);
+
+      if (activeThreadKey === threadKeyToRemove) {
+        const remaining = Object.values(updated);
+        if (remaining.length > 0) {
+          setActiveThreadKey(remaining[remaining.length - 1].threadKey);
+        } else {
+          setActiveThreadKey(null);
+          setIsChatDrawerOpen(false);
+        }
+      }
+    } catch (err) {
+      setListingToast(err.message || 'Failed to delete conversation.');
+      setTimeout(() => setListingToast(''), 4000);
     }
   };
 
@@ -1241,13 +2648,20 @@ export default function App() {
       !showCart &&
       !showSustainabilityModal &&
       !showSellModal &&
-      !chatProduct
+      !isChatDrawerOpen &&
+      !authModalMode &&
+      !showAccountHub
     ) {
       return;
     }
     const onKeyDown = (e) => {
       if (e.key === 'Escape') {
-        if (chatProduct) setChatProduct(null);
+        if (authModalMode) {
+          setAuthModalMode(null);
+          setPendingOpenSell(false);
+          setPendingChatProduct(null);
+        } else if (showAccountHub) setShowAccountHub(false);
+        else if (isChatDrawerOpen) setIsChatDrawerOpen(false);
         else if (showSellModal) setShowSellModal(false);
         else if (quickViewProduct) closeQuickView();
         else if (showCart) setShowCart(false);
@@ -1265,7 +2679,9 @@ export default function App() {
     showCart,
     showSustainabilityModal,
     showSellModal,
-    chatProduct
+    isChatDrawerOpen,
+    authModalMode,
+    showAccountHub
   ]);
 
   const categoryCounts = useMemo(() => {
@@ -1369,27 +2785,26 @@ export default function App() {
     }
   };
 
-  const handleSellerAvatarUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const compressed = await compressImageFile(file, 260, 0.85);
-    setSellerAvatar(compressed);
-  };
-
   const handleShoePhotoUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setShoeImageFile(file);
     const compressed = await compressImageFile(file, 800, 0.84);
     setShoeImage(compressed);
     setShoeImageUrlInput('');
   };
 
-  const handlePublishListing = (e) => {
+  const handlePublishListing = async (e) => {
     e.preventDefault();
     setSellFormError('');
 
-    const cleanSellerName = sellerName.trim();
-    const cleanLocation = sellerLocation.trim();
+    if (!currentUser) {
+      setShowSellModal(false);
+      setPendingOpenSell(true);
+      setAuthModalMode('login');
+      return;
+    }
+
     const cleanShoeName = shoeName.trim();
     const numericPrice = Number(shoePrice);
     const numericOrigPrice = shoeOriginalPrice
@@ -1400,14 +2815,6 @@ export default function App() {
       shoeBrand === 'OTHER' ? customBrand.trim() : shoeBrand
     ).toUpperCase();
 
-    if (!cleanSellerName) {
-      setSellFormError('Please enter your Seller Name.');
-      return;
-    }
-    if (!cleanLocation) {
-      setSellFormError('Please enter your City / Location.');
-      return;
-    }
     if (!finalBrand) {
       setSellFormError('Please specify the sneaker brand.');
       return;
@@ -1425,96 +2832,132 @@ export default function App() {
       return;
     }
 
-    const finalImage =
-      shoeImage || shoeImageUrlInput.trim() || DEFAULT_SHOE_PREVIEW;
-
-    const profileObj = {
-      name: cleanSellerName,
-      location: cleanLocation,
-      avatar: sellerAvatar,
-      bio:
-        sellerBio.trim() ||
-        'Verified SoleSyndicate community seller • Fast dispatch'
-    };
+    setIsPublishing(true);
 
     try {
-      localStorage.setItem(STORAGE_SELLER_KEY, JSON.stringify(profileObj));
-      setSavedSeller(profileObj);
-    } catch {
-      // Ignore storage errors
-    }
+      let finalImage =
+        shoeImage || shoeImageUrlInput.trim() || DEFAULT_SHOE_PREVIEW;
 
-    const discountPct =
-      numericOrigPrice && numericOrigPrice > numericPrice
-        ? `-${Math.round(
-            ((numericOrigPrice - numericPrice) / numericOrigPrice) * 100
-          )}% OFF`
-        : null;
-
-    const newProduct = {
-      id: Date.now(),
-      isUserListing: true,
-      brand: finalBrand,
-      name: cleanShoeName.toUpperCase(),
-      subtitle: shoeCondition.trim() || 'Community Verified Listing',
-      description:
-        shoeDescription.trim() ||
-        `Listed by ${cleanSellerName} in ${cleanLocation}. Inspected and ready for local meetup or tracked shipping.`,
-      specs: [
-        `Condition: ${shoeCondition.trim() || 'Excellent / Deadstock'}`,
-        `Seller Location: ${cleanLocation}`,
-        `Listed by: ${cleanSellerName}`,
-        'Includes original box & verified SoleSyndicate buyer protection'
-      ],
-      optionLabel: 'SELECT SIZE',
-      options: shoeSizes,
-      price: numericPrice,
-      originalPrice:
-        numericOrigPrice && numericOrigPrice > numericPrice
-          ? numericOrigPrice
-          : undefined,
-      discountTag: discountPct || undefined,
-      badge: 'SELLER LISTING',
-      rating: 5.0,
-      reviews: 1,
-      category: shoeCategory,
-      image: finalImage,
-      seller: {
-        ...profileObj,
-        listedAt: new Date().toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric'
-        })
+      if (shoeImageFile && isSupabaseConfigured) {
+        const publicUrl = await uploadSneakerImageToSupabase(shoeImageFile);
+        if (publicUrl) {
+          finalImage = publicUrl;
+        }
       }
-    };
 
-    setUserListings((prev) => [newProduct, ...prev]);
+      const sellerName = currentUser.name || currentUser.email.split('@')[0];
+      const sellerLocation = currentUser.location || 'Verified Seller';
 
-    setShoeName('');
-    setShoePrice('');
-    setShoeOriginalPrice('');
-    setShoeDescription('');
-    setShoeImage('');
-    setShoeImageUrlInput('');
-    setShowSellModal(false);
+      const profileObj = {
+        name: sellerName,
+        location: sellerLocation,
+        avatar: currentUser.avatar || '',
+        bio:
+          currentUser.bio ||
+          'Verified SoleSyndicate community seller • Fast dispatch'
+      };
 
-    resetFilters();
-    scrollToSection('catalog-storefront', 'All');
-    setListingToast(
-      `Listed "${newProduct.name}" by ${cleanSellerName} (${cleanLocation})!`
-    );
-    setTimeout(() => setListingToast(''), 5000);
+      const discountPct =
+        numericOrigPrice && numericOrigPrice > numericPrice
+          ? `-${Math.round(
+              ((numericOrigPrice - numericPrice) / numericOrigPrice) * 100
+            )}% OFF`
+          : null;
+
+      const draftProduct = {
+        id: Date.now(),
+        isUserListing: true,
+        ownerEmail: currentUser.email.trim().toLowerCase(),
+        brand: finalBrand,
+        name: cleanShoeName.toUpperCase(),
+        subtitle: shoeCondition.trim() || 'Community Verified Listing',
+        description:
+          shoeDescription.trim() ||
+          `Listed by ${sellerName} in ${sellerLocation}. Inspected and ready for local meetup or tracked shipping.`,
+        specs: [
+          `Condition: ${shoeCondition.trim() || 'Excellent / Deadstock'}`,
+          `Seller Location: ${sellerLocation}`,
+          `Listed by: ${sellerName}`,
+          'Includes original box & verified SoleSyndicate buyer protection'
+        ],
+        optionLabel: 'SELECT SIZE',
+        options: shoeSizes,
+        price: numericPrice,
+        originalPrice:
+          numericOrigPrice && numericOrigPrice > numericPrice
+            ? numericOrigPrice
+            : undefined,
+        discountTag: discountPct || undefined,
+        badge: 'SELLER LISTING',
+        rating: 5.0,
+        reviews: 1,
+        category: shoeCategory,
+        image: finalImage,
+        seller: {
+          ...profileObj,
+          listedAt: new Date().toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric'
+          })
+        }
+      };
+
+      const savedProduct = isSupabaseConfigured
+        ? await createListingInSupabase(draftProduct)
+        : draftProduct;
+
+      setUserListings((prev) => [savedProduct, ...prev]);
+
+      setShoeName('');
+      setShoePrice('');
+      setShoeOriginalPrice('');
+      setShoeDescription('');
+      setShoeImage('');
+      setShoeImageFile(null);
+      setShoeImageUrlInput('');
+      setShowSellModal(false);
+
+      resetFilters();
+      scrollToSection('catalog-storefront', 'All');
+      setListingToast(
+        isSupabaseConfigured
+          ? `Saved to Supabase & listed "${savedProduct.name}" under ${sellerName}!`
+          : `Listed "${savedProduct.name}" under ${sellerName}!`
+      );
+      setTimeout(() => setListingToast(''), 5500);
+    } catch (err) {
+      setSellFormError(err.message || 'Failed to publish listing to Supabase.');
+    } finally {
+      setIsPublishing(false);
+    }
   };
 
-  const handleDeleteUserListing = (productId) => {
-    setUserListings((prev) => prev.filter((item) => item.id !== productId));
-    setFavorites((prev) => prev.filter((id) => id !== productId));
-    if (quickViewProduct?.id === productId) {
-      closeQuickView();
+  const handleDeleteUserListing = async (productId) => {
+    const targetListing = userListings.find((item) => item.id === productId);
+    if (!targetListing) return;
+
+    if (!isListingOwner(targetListing, currentUser)) {
+      setListingToast('Only the seller who listed this sneaker can delete it.');
+      setTimeout(() => setListingToast(''), 4000);
+      return;
     }
-    if (chatProduct?.id === productId) {
-      setChatProduct(null);
+
+    try {
+      if (isSupabaseConfigured) {
+        await deleteListingFromSupabase(productId, currentUser.email);
+      }
+
+      setUserListings((prev) => prev.filter((item) => item.id !== productId));
+      setFavorites((prev) => prev.filter((id) => id !== productId));
+      if (quickViewProduct?.id === productId) {
+        closeQuickView();
+      }
+      setListingToast(`Removed "${targetListing.name}" from the marketplace.`);
+      setTimeout(() => setListingToast(''), 4000);
+    } catch (err) {
+      setListingToast(err.message || 'Unable to delete listing.');
+      setTimeout(() => setListingToast(''), 4500);
     }
   };
 
@@ -1594,10 +3037,34 @@ export default function App() {
     query.trim() !== '';
 
   const activeThreadsList = Object.values(chatThreads);
-  const activeChatMessages = chatProduct
-    ? chatThreads[chatProduct.id]?.messages || []
-    : [];
-  const activeChatSeller = chatProduct ? getProductSeller(chatProduct) : null;
+  const activeThread = activeThreadKey ? chatThreads[activeThreadKey] : null;
+  const myEmailLower = (currentUser?.email || '').trim().toLowerCase();
+  const isCurrentUserSellerInThread =
+    activeThread && activeThread.sellerEmail === myEmailLower;
+  const chatCounterpartName = activeThread
+    ? isCurrentUserSellerInThread
+      ? activeThread.buyerName
+      : activeThread.sellerName
+    : waitingSellerProduct
+    ? 'Buyer Inquiries'
+    : 'Messages';
+  const chatCounterpartRoleLabel = activeThread
+    ? isCurrentUserSellerInThread
+      ? `Buyer (${activeThread.buyerEmail})`
+      : `Seller (${activeThread.sellerEmail})`
+    : waitingSellerProduct
+    ? 'Your Listing'
+    : 'Direct User-to-User Chat';
+  const activeThreadProductObj = activeThread
+    ? allProducts.find((p) => String(p.id) === activeThread.listingId) || {
+        id: activeThread.listingId,
+        name: activeThread.listingName,
+        image: activeThread.listingImage,
+        price: activeThread.listingPrice,
+        brand: 'SNEAKER',
+        options: ['US 9']
+      }
+    : waitingSellerProduct;
 
   return (
     <div
@@ -1637,10 +3104,14 @@ export default function App() {
         </form>
 
         <div className="header-pills">
+
+  <AiShoeScanner />
+
+  {/* Your existing buttons stay here */}
           <button
             type="button"
             className="sell-pill-btn"
-            onClick={() => setShowSellModal(true)}
+            onClick={openSellPortal}
           >
             <span>+</span>
             <span>Sell Sneakers</span>
@@ -1680,6 +3151,41 @@ export default function App() {
             <span>Bag</span>
             <span className="bag-pill-count">{totalItems}</span>
           </button>
+
+          {currentUser ? (
+            <button
+              type="button"
+              className="auth-user-pill"
+              onClick={() => setShowAccountHub(true)}
+              title={`Signed in as ${currentUser.email}`}
+            >
+              {currentUser.avatar ? (
+                <img
+                  src={currentUser.avatar}
+                  alt={currentUser.name}
+                  className="auth-user-pill-avatar"
+                />
+              ) : (
+                <span className="auth-user-pill-initials">
+                  {getInitials(currentUser.name)}
+                </span>
+              )}
+              <span className="auth-user-pill-name">
+                {currentUser.name.split(' ')[0]}
+              </span>
+              {currentUser.emailVerified && (
+                <span className="auth-verified-dot" />
+              )}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="auth-header-btn"
+              onClick={() => setAuthModalMode('login')}
+            >
+              <span>Sign In / Register</span>
+            </button>
+          )}
         </div>
 
         <nav aria-label="Primary navigation">
@@ -1711,10 +3217,7 @@ export default function App() {
           >
             KIDS 20% OFF
           </button>
-          <button
-            type="button"
-            onClick={() => setShowSellModal(true)}
-          >
+          <button type="button" onClick={openSellPortal}>
             + LIST YOUR SHOES
           </button>
           <button
@@ -1757,7 +3260,6 @@ export default function App() {
         </button>
 
         <div className="ryst-hero-inner">
-          {/* LEFT EDITORIAL COPY & SWATCH SWITCHER */}
           <div className="ryst-hero-left">
             <h1 className="ryst-hero-title">{activeSlide.headline}</h1>
             <p className="ryst-hero-subtitle">{activeSlide.subcopy}</p>
@@ -1773,7 +3275,7 @@ export default function App() {
               <button
                 type="button"
                 className="ryst-pill-btn light-outline"
-                onClick={() => setShowSellModal(true)}
+                onClick={openSellPortal}
               >
                 + SELL YOUR PAIR
               </button>
@@ -1808,7 +3310,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* CENTER 3D POP-OUT SNEAKER CARD */}
           <div
             className="hero-shoe-stage"
             style={{
@@ -1851,7 +3352,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* RIGHT FLOATING SALE CARD */}
           <div className="ryst-hero-right">
             <div className="hero-sale-floating-card">
               <div
@@ -1900,7 +3400,6 @@ export default function App() {
 
       {/* RISING CONTENT SHEET THAT SLIDES OVER THE STICKY HERO */}
       <div className="scroll-stack-sheet">
-        {/* BEST SELLERS */}
         <section id="bestsellers-section" className="ryst-section">
           <div className="ryst-container">
             <div className="ryst-section-header scroll-up-item" data-scroll-up>
@@ -1971,7 +3470,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* 20% OFF KIDS STYLES PROMO BANNER */}
         <section id="kids-promo-section" className="kids-banner">
           <div className="kids-banner-inner">
             <div className="kids-banner-left scroll-up-item" data-scroll-up>
@@ -2018,7 +3516,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* INFINITE MARQUEE TICKER */}
         <div className="ryst-marquee" aria-hidden="true">
           <div className="ryst-marquee-track">
             {[0, 1].map((loop) => (
@@ -2028,7 +3525,7 @@ export default function App() {
                   <span className="ryst-marquee-star">✦</span>
                 </span>
                 <span className="ryst-marquee-item">
-                  CHAT DIRECTLY WITH VERIFIED SELLERS BEFORE YOU BUY
+                  REAL USER-TO-USER SELLER MESSAGING
                   <span className="ryst-marquee-star">✦</span>
                 </span>
                 <span className="ryst-marquee-item">
@@ -2044,7 +3541,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* SHOP BY COLLECTION */}
         <section className="ryst-section">
           <div className="ryst-container">
             <div className="ryst-section-header scroll-up-item" data-scroll-up>
@@ -2070,7 +3566,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* COMMITTED TO SUSTAINABILITY BANNER */}
         <section id="sustainability-section" className="sustain-banner">
           <div className="sustain-banner-inner">
             <div className="sustain-left scroll-up-item" data-scroll-up>
@@ -2105,7 +3600,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* FULL INTERACTIVE STOREFRONT CATALOG */}
         <section id="catalog-storefront" className="storefront">
           <div className="storefront-container">
             {listingToast && (
@@ -2143,7 +3637,7 @@ export default function App() {
                 <button
                   type="button"
                   className="catalog-sell-cta"
-                  onClick={() => setShowSellModal(true)}
+                  onClick={openSellPortal}
                 >
                   + List Your Sneakers
                 </button>
@@ -2170,7 +3664,6 @@ export default function App() {
             </div>
 
             <div className="storefront-layout">
-              {/* LEFT SIDEBAR FILTERS */}
               <aside className="filter-sidebar">
                 <div className="filter-header">
                   <h2>FILTERS</h2>
@@ -2185,7 +3678,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* WISHLIST TOGGLE */}
                 <div className="filter-group">
                   <div className="wishlist-row">
                     <div>
@@ -2206,7 +3698,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* CATEGORIES */}
                 <div className="filter-group">
                   <div className="filter-label">CATEGORY</div>
                   <ul className="category-list">
@@ -2235,7 +3726,6 @@ export default function App() {
                   </ul>
                 </div>
 
-                {/* BRANDS */}
                 <div className="filter-group">
                   <div className="brands-header">
                     <div className="filter-label">BRANDS</div>
@@ -2266,7 +3756,6 @@ export default function App() {
                 </div>
               </aside>
 
-              {/* RIGHT PRODUCT GRID */}
               <div>
                 {shown.length === 0 ? (
                   <div className="empty-state">
@@ -2284,6 +3773,10 @@ export default function App() {
                     {shown.map((product) => {
                       const isFav = favorites.includes(product.id);
                       const seller = getProductSeller(product);
+                      const canRemoveListing = isListingOwner(
+                        product,
+                        currentUser
+                      );
                       return (
                         <article key={product.id} className="product-card">
                           <div
@@ -2350,7 +3843,6 @@ export default function App() {
                             </h3>
                             <p className="subtitle">{product.subtitle}</p>
 
-                            {/* SELLER PROFILE & CHAT STRIP ON CARD */}
                             <div
                               className="card-seller-strip"
                               onClick={() => openQuickView(product)}
@@ -2378,20 +3870,24 @@ export default function App() {
                               <button
                                 type="button"
                                 className="seller-chat-chip-btn"
-                                title={`Chat with ${seller.name}`}
+                                title={
+                                  canRemoveListing
+                                    ? 'View buyer messages'
+                                    : `Message ${seller.name}`
+                                }
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   openChatWithSeller(product);
                                 }}
                               >
-                                💬 Chat
+                                {canRemoveListing ? '💬 Inbox' : '💬 Chat'}
                               </button>
 
-                              {product.isUserListing && (
+                              {canRemoveListing && (
                                 <button
                                   type="button"
                                   className="seller-remove-listing-btn"
-                                  title="Remove your listing"
+                                  title="Delete your listing"
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleDeleteUserListing(product.id);
@@ -2446,7 +3942,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* CUSTOMER REVIEWS SECTION */}
         <section className="reviews-section">
           <div className="ryst-container reviews-layout">
             <div>
@@ -2504,7 +3999,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* FOOTER WITH GOLDEN-YELLOW NEWSLETTER CARD */}
         <footer className="ryst-footer">
           <div className="ryst-container">
             <div className="ryst-footer-grid">
@@ -2552,10 +4046,7 @@ export default function App() {
 
                   <div>
                     <h4>COMMUNITY</h4>
-                    <button
-                      type="button"
-                      onClick={() => setShowSellModal(true)}
-                    >
+                    <button type="button" onClick={openSellPortal}>
                       + Sell Your Sneakers
                     </button>
                     <button type="button" onClick={openMessagesInbox}>
@@ -2563,9 +4054,13 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => setShowSustainabilityModal(true)}
+                      onClick={() =>
+                        currentUser
+                          ? setShowAccountHub(true)
+                          : setAuthModalMode('login')
+                      }
                     >
-                      Sustainability Report
+                      {currentUser ? '👤 My Gmail Account' : '🔐 Sign In / Register'}
                     </button>
                   </div>
                 </div>
@@ -2596,7 +4091,7 @@ export default function App() {
                         required
                         value={newsletterEmail}
                         onChange={(e) => setNewsletterEmail(e.target.value)}
-                        placeholder="you@example.com"
+                        placeholder="you@gmail.com"
                       />
                       <button type="submit">JOIN</button>
                     </div>
@@ -2624,41 +4119,32 @@ export default function App() {
         </footer>
       </div>
 
-      {/* CHAT WITH SELLER SLIDE-OVER DRAWER */}
-      {chatProduct && activeChatSeller && (
+      {/* REAL USER-TO-USER CHAT DRAWER (NO AUTOMATIC BOT REPLIES) */}
+      {isChatDrawerOpen && currentUser && (
         <div
           className="bag-backdrop"
-          onClick={() => setChatProduct(null)}
+          onClick={() => setIsChatDrawerOpen(false)}
           role="dialog"
           aria-modal="true"
-          aria-label="Chat with seller"
+          aria-label="Direct user-to-user messages"
         >
           <aside
             className="chat-drawer"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* CHAT HEADER */}
             <div className="chat-header">
               <div className="chat-seller-identity">
-                {activeChatSeller.avatar ? (
-                  <img
-                    src={activeChatSeller.avatar}
-                    alt={activeChatSeller.name}
-                    className="chat-seller-avatar"
-                  />
-                ) : (
-                  <div className="chat-seller-initials">
-                    {getInitials(activeChatSeller.name)}
-                  </div>
-                )}
+                <div className="chat-seller-initials">
+                  {getInitials(chatCounterpartName)}
+                </div>
 
                 <div>
                   <div className="chat-seller-name-row">
-                    <h3>{activeChatSeller.name}</h3>
-                    <span className="chat-online-dot" title="Online now" />
+                    <h3>{chatCounterpartName}</h3>
+                    <span className="chat-online-dot" title="Live sync active" />
                   </div>
                   <div className="chat-seller-sub">
-                    📍 {activeChatSeller.location} • Typically replies instantly
+                    {chatCounterpartRoleLabel} • Live Direct Chat
                   </div>
                 </div>
               </div>
@@ -2666,48 +4152,45 @@ export default function App() {
               <div className="chat-header-actions">
                 <button
                   type="button"
-                  className="chat-delete-btn"
-                  title={`Remove chat with ${activeChatSeller.name}`}
-                  onClick={() => deleteChatThread(chatProduct.id)}
-                >
-                  🗑 Remove
-                </button>
-                <button
-                  type="button"
                   className="bag-close-btn"
                   aria-label="Close chat"
-                  onClick={() => setChatProduct(null)}
+                  onClick={() => setIsChatDrawerOpen(false)}
                 >
                   ✕
                 </button>
               </div>
             </div>
 
-            {/* ACTIVE CONVERSATIONS SWITCHER */}
             {activeThreadsList.length > 0 && (
               <div className="chat-threads-bar">
-                {activeThreadsList.map(({ product: threadProd }) => {
-                  const s = getProductSeller(threadProd);
-                  const active = threadProd.id === chatProduct.id;
+                {activeThreadsList.map((thread) => {
+                  const active = thread.threadKey === activeThreadKey;
+                  const counterpart =
+                    thread.sellerEmail === myEmailLower
+                      ? `${thread.buyerName} (Buyer)`
+                      : `${thread.sellerName} (Seller)`;
                   return (
                     <div
-                      key={threadProd.id}
+                      key={thread.threadKey}
                       className={`chat-thread-pill ${active ? 'active' : ''}`}
                     >
                       <button
                         type="button"
                         className="chat-thread-select"
-                        onClick={() => openChatWithSeller(threadProd)}
+                        onClick={() => {
+                          setWaitingSellerProduct(null);
+                          setActiveThreadKey(thread.threadKey);
+                        }}
                       >
-                        <span>{s.name}</span>
-                        <small>• {threadProd.name}</small>
+                        <span>{counterpart}</span>
+                        <small>• {thread.listingName}</small>
                       </button>
                       <button
                         type="button"
                         className="chat-thread-remove"
-                        aria-label={`Remove chat with ${s.name}`}
-                        title={`Remove chat with ${s.name}`}
-                        onClick={() => deleteChatThread(threadProd.id)}
+                        aria-label={`Remove chat with ${counterpart}`}
+                        title={`Remove chat with ${counterpart}`}
+                        onClick={() => deleteChatThread(thread.threadKey)}
                       >
                         ✕
                       </button>
@@ -2717,98 +4200,139 @@ export default function App() {
               </div>
             )}
 
-            {/* PINNED PRODUCT CONTEXT BAR */}
-            <div className="chat-product-bar">
-              <img
-                src={chatProduct.image}
-                alt={chatProduct.name}
-                className="chat-product-thumb"
-              />
-              <div className="chat-product-info">
-                <div className="chat-product-title">{chatProduct.name}</div>
-                <div className="chat-product-price">
-                  ${chatProduct.price}.00 •{' '}
-                  {(chatProduct.options || []).slice(0, 3).join(', ')}
+            {activeThreadProductObj && (
+              <div className="chat-product-bar">
+                <img
+                  src={activeThreadProductObj.image}
+                  alt={activeThreadProductObj.name}
+                  className="chat-product-thumb"
+                />
+                <div className="chat-product-info">
+                  <div className="chat-product-title">
+                    {activeThreadProductObj.name}
+                  </div>
+                  <div className="chat-product-price">
+                    ${activeThreadProductObj.price}.00
+                  </div>
                 </div>
+                {!isCurrentUserSellerInThread && !waitingSellerProduct && (
+                  <button
+                    type="button"
+                    className="chat-product-bag-btn"
+                    onClick={() => {
+                      add(activeThreadProductObj);
+                      setIsChatDrawerOpen(false);
+                      setShowCart(true);
+                    }}
+                  >
+                    + Bag
+                  </button>
+                )}
               </div>
-              <button
-                type="button"
-                className="chat-product-bag-btn"
-                onClick={() => {
-                  add(chatProduct);
-                  setChatProduct(null);
-                  setShowCart(true);
-                }}
-              >
-                + Bag
-              </button>
-            </div>
+            )}
 
-            {/* SCROLLABLE CHAT MESSAGES */}
             <div className="chat-messages-scroll">
-              {activeChatMessages.map((msg) => (
-                <div
-                  key={msg.id}
-                  className={`chat-bubble-row ${
-                    msg.sender === 'buyer' ? 'buyer' : 'seller'
-                  }`}
-                >
-                  <div className="chat-bubble">
-                    <p>{msg.text}</p>
-                    <span className="chat-time">{msg.time}</span>
-                  </div>
+              {!activeThread ? (
+                <div className="bag-empty" style={{ padding: '40px 20px' }}>
+                  <div className="bag-empty-icon">💬</div>
+                  <h3>
+                    {waitingSellerProduct
+                      ? 'No Buyer Messages Yet'
+                      : 'No Conversations Yet'}
+                  </h3>
+                  <p>
+                    {waitingSellerProduct
+                      ? `When a buyer clicks Chat on "${waitingSellerProduct.name}", their message will appear here in real time so you can reply.`
+                      : 'Click "💬 Chat" on any sneaker listing to message the seller directly.'}
+                  </p>
                 </div>
-              ))}
-
-              {isSellerTyping && (
-                <div className="chat-bubble-row seller">
-                  <div className="chat-bubble typing">
-                    <span>{activeChatSeller.name} is typing...</span>
-                  </div>
+              ) : activeThread.messages.length === 0 ? (
+                <div className="bag-empty" style={{ padding: '40px 20px' }}>
+                  <div className="bag-empty-icon">✉️</div>
+                  <h3>Message {chatCounterpartName}</h3>
+                  <p>
+                    Send a message below about{' '}
+                    <strong>{activeThread.listingName}</strong>. Only{' '}
+                    {chatCounterpartName} will reply when online.
+                  </p>
                 </div>
+              ) : (
+                activeThread.messages.map((msg) => {
+                  const isMine = msg.senderEmail === myEmailLower;
+                  return (
+                    <div
+                      key={msg.id}
+                      className={`chat-bubble-row ${
+                        isMine ? 'buyer' : 'seller'
+                      }`}
+                    >
+                      <div className="chat-bubble">
+                        {!isMine && (
+                          <div
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              marginBottom: 3,
+                              opacity: 0.75
+                            }}
+                          >
+                            {msg.senderName}
+                          </div>
+                        )}
+                        <p>{msg.text}</p>
+                        <span className="chat-time">{msg.time}</span>
+                      </div>
+                    </div>
+                  );
+                })
               )}
               <div ref={chatMessagesEndRef} />
             </div>
 
-            {/* QUICK QUESTION CHIPS */}
-            <div className="chat-quick-prompts">
-              {QUICK_CHAT_PROMPTS.map((prompt) => (
-                <button
-                  key={prompt}
-                  type="button"
-                  className="chat-prompt-chip"
-                  onClick={() => sendChatMessage(prompt)}
-                >
-                  {prompt}
-                </button>
-              ))}
-            </div>
+            {activeThread && !isCurrentUserSellerInThread && (
+              <div className="chat-quick-prompts">
+                {QUICK_CHAT_PROMPTS.map((prompt) => (
+                  <button
+                    key={prompt}
+                    type="button"
+                    className="chat-prompt-chip"
+                    onClick={() => sendChatMessage(prompt)}
+                  >
+                    {prompt}
+                  </button>
+                ))}
+              </div>
+            )}
 
-            {/* MESSAGE COMPOSER */}
-            <form
-              className="chat-input-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                sendChatMessage(chatInput);
-              }}
-            >
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder={`Message ${activeChatSeller.name}...`}
-                aria-label="Type your message"
-              />
-              <button type="submit" disabled={!chatInput.trim()}>
-                Send
-              </button>
-            </form>
+            {activeThread && (
+              <form
+                className="chat-input-form"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  sendChatMessage(chatInput);
+                }}
+              >
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder={`Write a message to ${chatCounterpartName}...`}
+                  aria-label="Type your message"
+                />
+                <button
+                  type="submit"
+                  disabled={!chatInput.trim() || isSendingMessage}
+                >
+                  {isSendingMessage ? '...' : 'Send'}
+                </button>
+              </form>
+            )}
           </aside>
         </div>
       )}
 
-      {/* SELL / LIST SNEAKERS WITH SELLER PROFILE MODAL */}
-      {showSellModal && (
+      {/* SELL / LIST SNEAKERS MODAL */}
+      {showSellModal && currentUser && (
         <div
           className="qv-backdrop"
           onClick={() => setShowSellModal(false)}
@@ -2832,267 +4356,226 @@ export default function App() {
               </span>
               <h2 id="sell-modal-title">List Your Sneakers for Sale</h2>
               <p>
-                Create your seller profile with your name, photo, and location,
-                then publish your pair directly to the storefront.
+                Visible to all shoppers—only your account ({currentUser.email})
+                can delete this listing.
               </p>
             </div>
 
+            <div className="sell-connected-account">
+              <div className="sell-connected-left">
+                {currentUser.avatar ? (
+                  <img
+                    src={currentUser.avatar}
+                    alt={currentUser.name}
+                    className="sell-connected-avatar"
+                  />
+                ) : (
+                  <div className="seller-mini-initials">
+                    {getInitials(currentUser.name)}
+                  </div>
+                )}
+                <div>
+                  <div className="sell-connected-name">
+                    Listing as <strong>{currentUser.name}</strong>
+                  </div>
+                  <div className="sell-connected-meta">
+                    📍 {currentUser.location || 'Location not set'} •{' '}
+                    {currentUser.email}
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                className="sell-edit-account-btn"
+                onClick={() => {
+                  setShowSellModal(false);
+                  setShowAccountHub(true);
+                }}
+              >
+                Edit Profile
+              </button>
+            </div>
+
             <form className="sell-form" onSubmit={handlePublishListing}>
-              <div className="sell-form-grid">
-                {/* LEFT COLUMN: SELLER PROFILE */}
-                <div className="sell-section-card">
-                  <div className="sell-section-title">
-                    <span>1. YOUR SELLER PROFILE</span>
-                  </div>
+              <div className="sell-section-card">
+                <div className="sell-section-title">
+                  <span>SNEAKER LISTING DETAILS</span>
+                </div>
 
-                  <div className="seller-avatar-upload-row">
-                    <div className="seller-avatar-preview">
-                      {sellerAvatar ? (
-                        <img src={sellerAvatar} alt="Seller avatar preview" />
-                      ) : (
-                        <span>{getInitials(sellerName || 'SS')}</span>
-                      )}
-                    </div>
-
-                    <div className="seller-avatar-actions">
-                      <label className="sell-upload-pill">
-                        Upload Profile Photo
-                        <input
-                          type="file"
-                          accept="image/*"
-                          onChange={handleSellerAvatarUpload}
-                          hidden
-                        />
-                      </label>
-                      {sellerAvatar && (
-                        <button
-                          type="button"
-                          className="sell-clear-link"
-                          onClick={() => setSellerAvatar('')}
-                        >
-                          Remove photo
-                        </button>
-                      )}
-                      <small>JPG or PNG • Saved for future listings</small>
-                    </div>
+                <div className="sell-row-2">
+                  <div className="sell-field">
+                    <label htmlFor="shoe-brand">BRAND *</label>
+                    <select
+                      id="shoe-brand"
+                      value={shoeBrand}
+                      onChange={(e) => setShoeBrand(e.target.value)}
+                    >
+                      <option value="NIKE">NIKE</option>
+                      <option value="ADIDAS">ADIDAS</option>
+                      <option value="ON CLOUD">ON CLOUD</option>
+                      <option value="OTHER">Other Brand...</option>
+                    </select>
                   </div>
 
                   <div className="sell-field">
-                    <label htmlFor="seller-name">YOUR FULL NAME *</label>
+                    <label htmlFor="shoe-category">COLLECTION *</label>
+                    <select
+                      id="shoe-category"
+                      value={shoeCategory}
+                      onChange={(e) => setShoeCategory(e.target.value)}
+                    >
+                      <option value="Limited Edition">Limited Edition</option>
+                      <option value="Performance Series">
+                        Performance Series
+                      </option>
+                      <option value="Kids Collection">Kids Collection</option>
+                    </select>
+                  </div>
+                </div>
+
+                {shoeBrand === 'OTHER' && (
+                  <div className="sell-field">
+                    <label htmlFor="custom-brand">ENTER BRAND NAME *</label>
                     <input
-                      id="seller-name"
+                      id="custom-brand"
                       type="text"
                       required
-                      value={sellerName}
-                      onChange={(e) => setSellerName(e.target.value)}
-                      placeholder="e.g. Simon Cruz"
+                      value={customBrand}
+                      onChange={(e) => setCustomBrand(e.target.value)}
+                      placeholder="e.g. New Balance, Jordan, ASICS"
+                    />
+                  </div>
+                )}
+
+                <div className="sell-field">
+                  <label htmlFor="shoe-model">SNEAKER MODEL NAME *</label>
+                  <input
+                    id="shoe-model"
+                    type="text"
+                    required
+                    value={shoeName}
+                    onChange={(e) => setShoeName(e.target.value)}
+                    placeholder="e.g. Nike Dunk Low Retro Panda"
+                  />
+                </div>
+
+                <div className="sell-row-2">
+                  <div className="sell-field">
+                    <label htmlFor="shoe-price">ASKING PRICE (USD) *</label>
+                    <input
+                      id="shoe-price"
+                      type="number"
+                      min="1"
+                      step="1"
+                      required
+                      value={shoePrice}
+                      onChange={(e) => setShoePrice(e.target.value)}
+                      placeholder="145"
                     />
                   </div>
 
                   <div className="sell-field">
-                    <label htmlFor="seller-location">CITY / LOCATION *</label>
-                    <input
-                      id="seller-location"
-                      type="text"
-                      required
-                      value={sellerLocation}
-                      onChange={(e) => setSellerLocation(e.target.value)}
-                      placeholder="e.g. Digos City, Davao Region"
-                    />
-                  </div>
-
-                  <div className="sell-field">
-                    <label htmlFor="seller-bio">
-                      SELLER BIO / MEETUP NOTE
+                    <label htmlFor="shoe-orig-price">
+                      RETAIL PRICE (OPTIONAL)
                     </label>
-                    <textarea
-                      id="seller-bio"
-                      rows={3}
-                      value={sellerBio}
-                      onChange={(e) => setSellerBio(e.target.value)}
-                      placeholder="e.g. Sneaker collector • Open for local meetup or same-day courier shipping"
+                    <input
+                      id="shoe-orig-price"
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={shoeOriginalPrice}
+                      onChange={(e) => setShoeOriginalPrice(e.target.value)}
+                      placeholder="180"
                     />
                   </div>
                 </div>
 
-                {/* RIGHT COLUMN: SNEAKER DETAILS */}
-                <div className="sell-section-card">
-                  <div className="sell-section-title">
-                    <span>2. SNEAKER LISTING DETAILS</span>
+                <div className="sell-field">
+                  <label htmlFor="shoe-condition">CONDITION / TAGLINE</label>
+                  <input
+                    id="shoe-condition"
+                    type="text"
+                    value={shoeCondition}
+                    onChange={(e) => setShoeCondition(e.target.value)}
+                    placeholder="Brand New Deadstock • Original Box"
+                  />
+                </div>
+
+                <div className="sell-field">
+                  <label>AVAILABLE SIZES *</label>
+                  <div className="sell-size-pills">
+                    {AVAILABLE_SHOE_SIZES.map((sz) => {
+                      const active = shoeSizes.includes(sz);
+                      return (
+                        <button
+                          key={sz}
+                          type="button"
+                          className={`sell-size-pill ${
+                            active ? 'active' : ''
+                          }`}
+                          onClick={() => toggleShoeSize(sz)}
+                        >
+                          {sz}
+                        </button>
+                      );
+                    })}
                   </div>
+                </div>
 
-                  <div className="sell-row-2">
-                    <div className="sell-field">
-                      <label htmlFor="shoe-brand">BRAND *</label>
-                      <select
-                        id="shoe-brand"
-                        value={shoeBrand}
-                        onChange={(e) => setShoeBrand(e.target.value)}
-                      >
-                        <option value="NIKE">NIKE</option>
-                        <option value="ADIDAS">ADIDAS</option>
-                        <option value="ON CLOUD">ON CLOUD</option>
-                        <option value="OTHER">Other Brand...</option>
-                      </select>
-                    </div>
-
-                    <div className="sell-field">
-                      <label htmlFor="shoe-category">COLLECTION *</label>
-                      <select
-                        id="shoe-category"
-                        value={shoeCategory}
-                        onChange={(e) => setShoeCategory(e.target.value)}
-                      >
-                        <option value="Limited Edition">Limited Edition</option>
-                        <option value="Performance Series">
-                          Performance Series
-                        </option>
-                        <option value="Kids Collection">Kids Collection</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {shoeBrand === 'OTHER' && (
-                    <div className="sell-field">
-                      <label htmlFor="custom-brand">ENTER BRAND NAME *</label>
+                <div className="sell-field">
+                  <label>SNEAKER PHOTO (UPLOADS TO SUPABASE STORAGE)</label>
+                  <div className="sell-photo-row">
+                    <label className="sell-upload-pill">
+                      📷 Upload Shoe Photo
                       <input
-                        id="custom-brand"
-                        type="text"
-                        required
-                        value={customBrand}
-                        onChange={(e) => setCustomBrand(e.target.value)}
-                        placeholder="e.g. New Balance, Jordan, ASICS"
+                        type="file"
+                        accept="image/*"
+                        onChange={handleShoePhotoUpload}
+                        hidden
                       />
+                    </label>
+                    <input
+                      type="url"
+                      value={shoeImageUrlInput}
+                      onChange={(e) => {
+                        setShoeImageUrlInput(e.target.value);
+                        setShoeImage('');
+                        setShoeImageFile(null);
+                      }}
+                      placeholder="Or paste image URL..."
+                    />
+                  </div>
+
+                  {(shoeImage || shoeImageUrlInput) && (
+                    <div className="sell-shoe-preview-box">
+                      <img
+                        src={shoeImage || shoeImageUrlInput}
+                        alt="Sneaker preview"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShoeImage('');
+                          setShoeImageFile(null);
+                          setShoeImageUrlInput('');
+                        }}
+                      >
+                        Remove
+                      </button>
                     </div>
                   )}
+                </div>
 
-                  <div className="sell-field">
-                    <label htmlFor="shoe-model">SNEAKER MODEL NAME *</label>
-                    <input
-                      id="shoe-model"
-                      type="text"
-                      required
-                      value={shoeName}
-                      onChange={(e) => setShoeName(e.target.value)}
-                      placeholder="e.g. Nike Dunk Low Retro Panda"
-                    />
-                  </div>
-
-                  <div className="sell-row-2">
-                    <div className="sell-field">
-                      <label htmlFor="shoe-price">ASKING PRICE (USD) *</label>
-                      <input
-                        id="shoe-price"
-                        type="number"
-                        min="1"
-                        step="1"
-                        required
-                        value={shoePrice}
-                        onChange={(e) => setShoePrice(e.target.value)}
-                        placeholder="145"
-                      />
-                    </div>
-
-                    <div className="sell-field">
-                      <label htmlFor="shoe-orig-price">
-                        RETAIL PRICE (OPTIONAL)
-                      </label>
-                      <input
-                        id="shoe-orig-price"
-                        type="number"
-                        min="1"
-                        step="1"
-                        value={shoeOriginalPrice}
-                        onChange={(e) => setShoeOriginalPrice(e.target.value)}
-                        placeholder="180"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="sell-field">
-                    <label htmlFor="shoe-condition">CONDITION / TAGLINE</label>
-                    <input
-                      id="shoe-condition"
-                      type="text"
-                      value={shoeCondition}
-                      onChange={(e) => setShoeCondition(e.target.value)}
-                      placeholder="Brand New Deadstock • Original Box"
-                    />
-                  </div>
-
-                  <div className="sell-field">
-                    <label>AVAILABLE SIZES *</label>
-                    <div className="sell-size-pills">
-                      {AVAILABLE_SHOE_SIZES.map((sz) => {
-                        const active = shoeSizes.includes(sz);
-                        return (
-                          <button
-                            key={sz}
-                            type="button"
-                            className={`sell-size-pill ${
-                              active ? 'active' : ''
-                            }`}
-                            onClick={() => toggleShoeSize(sz)}
-                          >
-                            {sz}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="sell-field">
-                    <label>SNEAKER PHOTO</label>
-                    <div className="sell-photo-row">
-                      <label className="sell-upload-pill">
-                        📷 Upload Shoe Photo
-                        <input
-                          type="file"
-                          accept="image/*"
-                          onChange={handleShoePhotoUpload}
-                          hidden
-                        />
-                      </label>
-                      <input
-                        type="url"
-                        value={shoeImageUrlInput}
-                        onChange={(e) => {
-                          setShoeImageUrlInput(e.target.value);
-                          setShoeImage('');
-                        }}
-                        placeholder="Or paste image URL..."
-                      />
-                    </div>
-
-                    {(shoeImage || shoeImageUrlInput) && (
-                      <div className="sell-shoe-preview-box">
-                        <img
-                          src={shoeImage || shoeImageUrlInput}
-                          alt="Sneaker preview"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShoeImage('');
-                            setShoeImageUrlInput('');
-                          }}
-                        >
-                          Remove
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="sell-field">
-                    <label htmlFor="shoe-desc">DESCRIPTION</label>
-                    <textarea
-                      id="shoe-desc"
-                      rows={2}
-                      value={shoeDescription}
-                      onChange={(e) => setShoeDescription(e.target.value)}
-                      placeholder="Colorway details, box condition, or sizing fit notes..."
-                    />
-                  </div>
+                <div className="sell-field">
+                  <label htmlFor="shoe-desc">DESCRIPTION</label>
+                  <textarea
+                    id="shoe-desc"
+                    rows={2}
+                    value={shoeDescription}
+                    onChange={(e) => setShoeDescription(e.target.value)}
+                    placeholder="Colorway details, box condition, or sizing fit notes..."
+                  />
                 </div>
               </div>
 
@@ -3104,12 +4587,19 @@ export default function App() {
                 <button
                   type="button"
                   className="sell-cancel-btn"
+                  disabled={isPublishing}
                   onClick={() => setShowSellModal(false)}
                 >
                   Cancel
                 </button>
-                <button type="submit" className="sell-submit-btn">
-                  Publish Listing to SoleSyndicate →
+                <button
+                  type="submit"
+                  className="sell-submit-btn"
+                  disabled={isPublishing}
+                >
+                  {isPublishing
+                    ? 'Uploading Image & Saving to Supabase...'
+                    : 'Publish Listing to SoleSyndicate →'}
                 </button>
               </div>
             </form>
@@ -3170,9 +4660,12 @@ export default function App() {
               <h2 className="qv-title">{quickViewProduct.name}</h2>
               <p className="qv-subtitle">{quickViewProduct.subtitle}</p>
 
-              {/* SELLER PROFILE & DIRECT CHAT CARD IN QUICK VIEW */}
               {(() => {
                 const qvSeller = getProductSeller(quickViewProduct);
+                const canDeleteQv = isListingOwner(
+                  quickViewProduct,
+                  currentUser
+                );
                 return (
                   <div className="qv-seller-card">
                     {qvSeller.avatar ? (
@@ -3203,13 +4696,35 @@ export default function App() {
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      className="qv-chat-seller-btn"
-                      onClick={() => openChatWithSeller(quickViewProduct)}
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 6,
+                        flexShrink: 0
+                      }}
                     >
-                      💬 Chat
-                    </button>
+                      <button
+                        type="button"
+                        className="qv-chat-seller-btn"
+                        onClick={() => openChatWithSeller(quickViewProduct)}
+                      >
+                        {canDeleteQv ? '💬 Inbox' : '💬 Chat'}
+                      </button>
+
+                      {canDeleteQv && (
+                        <button
+                          type="button"
+                          className="account-signout-btn"
+                          style={{ padding: '6px 10px', fontSize: 11 }}
+                          onClick={() =>
+                            handleDeleteUserListing(quickViewProduct.id)
+                          }
+                        >
+                          Delete
+                        </button>
+                      )}
+                    </div>
                   </div>
                 );
               })()}
@@ -3555,10 +5070,25 @@ export default function App() {
                   type="button"
                   className="bag-checkout-btn"
                   onClick={() => {
+                    if (currentUser) {
+                      const newOrder = {
+                        id: Math.floor(100000 + Math.random() * 900000),
+                        userEmail: currentUser.email,
+                        date: new Date().toLocaleDateString('en-US', {
+                          month: 'short',
+                          day: 'numeric',
+                          year: 'numeric'
+                        }),
+                        total: formatMoney(grandTotal),
+                        items: cart
+                      };
+                      setOrders((prev) => [newOrder, ...prev]);
+                    }
+
                     alert(
-                      `Order confirmed! Total: $${formatMoney(
-                        grandTotal
-                      )}. Thank you for shopping at SoleSyndicate.`
+                      `Order confirmed! Total: $${formatMoney(grandTotal)}.${
+                        currentUser ? ` Receipt sent to ${currentUser.email}.` : ''
+                      } Thank you for shopping at SoleSyndicate.`
                     );
                     setCart([]);
                     setAppliedPromo('');
@@ -3572,6 +5102,37 @@ export default function App() {
             )}
           </aside>
         </div>
+      )}
+
+      {/* GMAIL / GOOGLE API LOGIN & REGISTRATION MODAL */}
+      {authModalMode && (
+        <AuthModal
+          initialMode={authModalMode}
+          registeredUsers={registeredUsers}
+          onClose={() => {
+            setAuthModalMode(null);
+            setPendingOpenSell(false);
+            setPendingChatProduct(null);
+          }}
+          onCompleteAuth={handleCompleteAuth}
+        />
+      )}
+
+      {/* LOGGED-IN GMAIL MEMBER ACCOUNT HUB */}
+      {showAccountHub && currentUser && (
+        <AccountHubModal
+          user={currentUser}
+          userListings={userListings.filter((item) =>
+            isListingOwner(item, currentUser)
+          )}
+          orders={orders}
+          favoritesCount={favorites.length}
+          onClose={() => setShowAccountHub(false)}
+          onUpdateProfile={handleUpdateUserProfile}
+          onDeleteListing={handleDeleteUserListing}
+          onOpenSellModal={openSellPortal}
+          onSignOut={handleSignOut}
+        />
       )}
     </div>
   );
