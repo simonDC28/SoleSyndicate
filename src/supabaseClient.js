@@ -14,10 +14,70 @@ export const supabase = isSupabaseConfigured
 
 const BUCKET_NAME = 'sneaker-images';
 
+export async function signUpWithSupabase({ email, password, name, location, role }) {
+  if (!supabase) return null;
+
+  const cleanEmail = email.trim().toLowerCase();
+  const { data, error } = await supabase.auth.signUp({
+    email: cleanEmail,
+    password,
+    options: {
+      data: { name, location, role }
+    }
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data;
+}
+
+export async function signInWithSupabase(email, password) {
+  if (!supabase) return null;
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: email.trim().toLowerCase(),
+    password
+  });
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return data;
+}
+
+export async function signOutOfSupabase() {
+  if (!supabase) return;
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
+export function subscribeToSupabaseAuth(onChange) {
+  if (!supabase) return () => {};
+
+  const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+    onChange(session?.user || null);
+  });
+
+  return () => data.subscription.unsubscribe();
+}
+
+export async function getSupabaseSessionUser() {
+  if (!supabase) return null;
+  const { data, error } = await supabase.auth.getUser();
+  if (error) return null;
+  return data.user || null;
+}
+
 function mapRowToProduct(row) {
   return {
     id: row.id,
     isUserListing: true,
+    ownerId: row.owner_id || null,
     ownerEmail: row.owner_email,
     brand: row.brand,
     name: row.name,
@@ -96,6 +156,11 @@ export async function fetchListingsFromSupabase() {
 export async function createListingInSupabase(product) {
   if (!supabase) return product;
 
+  const authUser = await getSupabaseSessionUser();
+  if (!authUser) {
+    throw new Error('Sign in before publishing a listing.');
+  }
+
   const rowPayload = {
     brand: product.brand,
     name: product.name,
@@ -116,7 +181,8 @@ export async function createListingInSupabase(product) {
     seller_name: product.seller.name,
     seller_location: product.seller.location,
     seller_avatar: product.seller.avatar || '',
-    seller_bio: product.seller.bio || ''
+    seller_bio: product.seller.bio || '',
+    owner_id: authUser.id
   };
 
   const { data, error } = await supabase
@@ -132,24 +198,22 @@ export async function createListingInSupabase(product) {
   return mapRowToProduct(data);
 }
 
-export async function deleteListingFromSupabase(listingId, ownerEmail) {
+export async function deleteListingFromSupabase(listingId) {
   if (!supabase) return true;
 
-  if (!ownerEmail) {
+  const authUser = await getSupabaseSessionUser();
+  if (!authUser) {
     throw new Error('You must sign in as the seller to delete this listing.');
   }
 
-  const { data, error } = await supabase.rpc('delete_my_listing', {
-    p_listing_id: listingId,
-    p_owner_email: ownerEmail.trim().toLowerCase()
-  });
+  const { error } = await supabase
+    .from('listings')
+    .delete()
+    .eq('id', listingId)
+    .eq('owner_id', authUser.id);
 
   if (error) {
     throw new Error(`Delete failed: ${error.message}`);
-  }
-
-  if (!data) {
-    throw new Error('Only the seller who listed this product can delete it.');
   }
 
   return true;
@@ -203,6 +267,16 @@ export async function sendMessageInSupabase(payload) {
     };
   }
 
+  const authUser = await getSupabaseSessionUser();
+  if (!authUser) {
+    throw new Error('Sign in before sending a message.');
+  }
+
+  const sellerEmail = payload.seller_email.trim().toLowerCase();
+  const buyerEmail = payload.buyer_email.trim().toLowerCase();
+  const senderEmail = payload.sender_email.trim().toLowerCase();
+  const isBuyerSender = senderEmail === buyerEmail;
+
   const { data, error } = await supabase
     .from('messages')
     .insert([
@@ -211,13 +285,20 @@ export async function sendMessageInSupabase(payload) {
         listing_name: payload.listing_name,
         listing_image: payload.listing_image || '',
         listing_price: Number(payload.listing_price || 0),
-        seller_email: payload.seller_email.trim().toLowerCase(),
+        seller_email: sellerEmail,
         seller_name: payload.seller_name,
-        buyer_email: payload.buyer_email.trim().toLowerCase(),
+        buyer_email: buyerEmail,
         buyer_name: payload.buyer_name,
-        sender_email: payload.sender_email.trim().toLowerCase(),
+        sender_email: senderEmail,
         sender_name: payload.sender_name,
-        message_text: payload.message_text.trim()
+        message_text: payload.message_text.trim(),
+        sender_user_id: authUser.id,
+        buyer_user_id: isBuyerSender
+          ? authUser.id
+          : payload.buyer_user_id || null,
+        seller_user_id: isBuyerSender
+          ? payload.seller_user_id || null
+          : authUser.id
       }
     ])
     .select()
@@ -270,12 +351,13 @@ export function subscribeToUserMessages(userEmail, onChange) {
 // =========================================================
 export async function fetchUserAccountFromSupabase(email) {
   if (!supabase || !email) return null;
+  const authUser = await getSupabaseSessionUser();
+  if (!authUser) return null;
 
-  const cleanEmail = email.trim().toLowerCase();
   const { data, error } = await supabase
     .from('user_profiles')
     .select('*')
-    .eq('email', cleanEmail)
+    .eq('id', authUser.id)
     .maybeSingle();
 
   if (error) {
@@ -290,13 +372,16 @@ export async function saveUserAccountToSupabase(userObj, accountState) {
   if (!supabase || !userObj?.email) return;
 
   const cleanEmail = userObj.email.trim().toLowerCase();
+  const authUser = await getSupabaseSessionUser();
+  if (!authUser) return;
+
   const row = {
+    id: authUser.id,
     email: cleanEmail,
     google_sub: userObj.googleSub || null,
     auth_provider: userObj.authProvider || 'gmail-form',
     email_verified: Boolean(userObj.emailVerified),
     name: userObj.name || cleanEmail.split('@')[0],
-    password: userObj.password || null,
     location: userObj.location || '',
     role: userObj.role || 'Buyer & Seller',
     avatar: userObj.avatar || '',
