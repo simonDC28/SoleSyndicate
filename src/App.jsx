@@ -13,7 +13,10 @@ import {
   sendMessageInSupabase,
   subscribeToListings,
   subscribeToUserMessages,
-  uploadSneakerImageToSupabase
+  uploadSneakerImageToSupabase,
+  signInWithSupabase,
+  signOutOfSupabase,
+  signUpWithSupabase
 } from './supabaseClient';
 
 // =========================================================
@@ -413,6 +416,8 @@ function groupMessageRowsIntoThreads(rows) {
         sellerName: row.seller_name,
         buyerEmail: row.buyer_email.trim().toLowerCase(),
         buyerName: row.buyer_name,
+        buyerUserId: row.buyer_user_id || null,
+        sellerUserId: row.seller_user_id || null,
         messages: []
       };
     }
@@ -581,6 +586,33 @@ function AuthModal({
     setIsSubmitting(true);
     try {
       const cleanEmail = email.trim().toLowerCase();
+      if (isSupabaseConfigured) {
+        const authData = await signInWithSupabase(cleanEmail, password);
+        const authUser = authData?.user;
+        const cloudProfile = await fetchUserAccountFromSupabase(cleanEmail);
+        await onCompleteAuth(
+          {
+            id: authUser?.id || `user_${cleanEmail}`,
+            googleSub: cloudProfile?.google_sub,
+            authProvider: 'gmail-form',
+            emailVerified: Boolean(authUser?.email_confirmed_at),
+            name: cloudProfile?.name || authUser?.user_metadata?.name || cleanEmail.split('@')[0],
+            email: cleanEmail,
+            location: cloudProfile?.location || '',
+            role: cloudProfile?.role || 'Buyer & Seller',
+            avatar: cloudProfile?.avatar || '',
+            bio: cloudProfile?.bio || '',
+            savedState: {
+              favorites: cloudProfile?.favorites || [],
+              cart: cloudProfile?.cart || [],
+              orders: cloudProfile?.orders || []
+            }
+          },
+          false
+        );
+        return;
+      }
+
       let matched = registeredUsers.find(
         (u) => u.email.toLowerCase() === cleanEmail
       );
@@ -654,6 +686,46 @@ function AuthModal({
 
     setIsSubmitting(true);
     try {
+      if (isSupabaseConfigured) {
+        const authData = await signUpWithSupabase({
+          email: cleanEmail,
+          password,
+          name: cleanName,
+          location: cleanLocation,
+          role
+        });
+        const authUser = authData?.user;
+        if (!authUser || !authData.session) {
+          setError(
+            authUser
+              ? 'Account created. Check your email to confirm it, then sign in.'
+              : 'Unable to create your account. Please try again.'
+          );
+          return;
+        }
+
+        await onCompleteAuth(
+          {
+            id: authUser.id,
+            authProvider: 'gmail-form',
+            emailVerified: Boolean(authUser.email_confirmed_at),
+            name: cleanName,
+            email: cleanEmail,
+            location: cleanLocation,
+            role,
+            avatar: '',
+            bio: `${role} • ${cleanLocation}`,
+            createdAt: new Date().toLocaleDateString('en-US', {
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric'
+            })
+          },
+          true
+        );
+        return;
+      }
+
       const existsLocally = registeredUsers.some(
         (u) => u.email.toLowerCase() === cleanEmail
       );
@@ -2217,8 +2289,10 @@ export default function App() {
           listingPrice: product.price,
           sellerEmail,
           sellerName: seller.name,
+          sellerUserId: product.ownerId || null,
           buyerEmail: myEmail,
           buyerName: loggedInUser.name || myEmail.split('@')[0],
+          buyerUserId: loggedInUser.id || null,
           messages: []
         }
       };
@@ -2405,6 +2479,9 @@ export default function App() {
     if (currentUser?.accessToken) {
       signOutGoogleSession(currentUser.accessToken);
     }
+    if (isSupabaseConfigured) {
+      await signOutOfSupabase();
+    }
 
     // 2. Reset all active session state for the next visitor / new account
     setIsAccountHydrated(false);
@@ -2576,6 +2653,8 @@ export default function App() {
         buyer_name: currentThread.buyerName,
         sender_email: myEmail,
         sender_name: myName,
+        buyer_user_id: currentThread.buyerUserId,
+        seller_user_id: currentThread.sellerUserId,
         message_text: trimmed
       });
 
