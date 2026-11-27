@@ -112,14 +112,27 @@ function mapRowToProduct(row) {
   };
 }
 
+
 export async function uploadSneakerImageToSupabase(file) {
   if (!supabase || !file) return null;
+
+  const authUser = await getSupabaseSessionUser();
+
+  if (!authUser) {
+    throw new Error('Sign in before uploading a sneaker image.');
+  }
+
+
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Only image files are allowed.');
+  }
 
   const ext = (file.name.split('.').pop() || 'jpg').replace(
     /[^a-zA-Z0-9]/g,
     ''
   );
-  const filePath = `listings/${Date.now()}-${Math.random()
+
+  const filePath = `${authUser.id}/listings/${Date.now()}-${Math.random()
     .toString(36)
     .slice(2, 8)}.${ext}`;
 
@@ -134,7 +147,10 @@ export async function uploadSneakerImageToSupabase(file) {
     throw new Error(`Image upload failed: ${uploadError.message}`);
   }
 
-  const { data } = supabase.storage.from(BUCKET_NAME).getPublicUrl(filePath);
+  const { data } = supabase.storage
+    .from(BUCKET_NAME)
+    .getPublicUrl(filePath);
+
   return data.publicUrl;
 }
 
